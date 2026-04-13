@@ -1,0 +1,14 @@
+# Working directory (local development only)
+workspace/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.vscode/
+.qwen/
+.idea/
+*.swp
+*.swo
+*~
