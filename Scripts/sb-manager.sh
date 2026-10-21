@@ -625,16 +625,10 @@ get_user_mode() {
 }
 
 build_user_ru_rule() {
-    ru_sets=""
-    for ru_set in geoip-ru category-gov-ru ru-blocked
-    do
-        [[ $(jq --arg set "${ru_set}" '[.route.rule_set[].tag] | index($set) != null' /etc/sing-box/config.json) == "true" ]] && ru_sets+="\"${ru_set}\","
-    done
-    ru_sets=${ru_sets%,}
+    ru_sets=$(jq -c '([(.route.rule_set // [])[].tag]) as $existing | ["geoip-ru", "category-gov-ru"] | map(select(. as $s | $existing | index($s) != null))' /etc/sing-box/config.json 2>/dev/null)
+    [[ -z "$ru_sets" ]] && ru_sets="[]"
 
-    new_rule="{\"auth_user\":[\"${username}\"],\"domain_suffix\":[\".ru\",\".su\",\".ru.com\",\".ru.net\"],\"domain_keyword\":[\"xn--\"]"
-    [[ -n $ru_sets ]] && new_rule+=",\"rule_set\":[${ru_sets}]"
-    new_rule+=",\"outbound\":\"${new_outbound}\"}"
+    new_rule=$(jq -cn --arg u "${username}" --arg o "${new_outbound}" --argjson sets "${ru_sets}" '{auth_user: [$u], domain_suffix: [".ru", ".su", ".ru.com", ".ru.net"], domain_keyword: ["xn--"]} + (if ($sets | length) > 0 then {rule_set: $sets} else {} end) + {outbound: $o}')
 }
 
 edit_user_routing() {
@@ -643,6 +637,8 @@ edit_user_routing() {
     info_message[1_en]="The routing mode of the user ${textcolor}${username}${clear} has been changed and applied on the server"
     info_message[2_ru]="${red}Ошибка: проверка конфига завершилась с ошибкой, изменения отменены${clear}"
     info_message[2_en]="${red}Error: config check failed, changes have been reverted${clear}"
+    info_message[3_ru]="${red}Ошибка: не удалось создать резервную копию конфига, изменения не применены${clear}"
+    info_message[3_en]="${red}Error: failed to create a config backup, changes have not been applied${clear}"
 
     new_rule=""
     case $mode_option in
@@ -657,30 +653,39 @@ edit_user_routing() {
 
     if [[ $mode_option =~ ^(2|3|4)$ ]]
     then
-        new_rule="{\"auth_user\":[\"${username}\"],\"outbound\":\"${new_outbound}\"}"
+        new_rule=$(jq -cn --arg u "${username}" --arg o "${new_outbound}" '{auth_user: [$u], outbound: $o}')
     elif [[ $mode_option =~ ^(5|6|7)$ ]]
     then
         build_user_ru_rule
     fi
 
-    cp -f /etc/sing-box/config.json /etc/sing-box/config.json.bak-usermode
+    if ! cp -f /etc/sing-box/config.json /etc/sing-box/config.json.bak-usermode
+    then
+        echo -e "${info_message[3_$language]}"
+        echo ""
+        main_menu
+        return 1
+    fi
 
     echo "$(jq --arg u "${username}" 'del(.route.rules[] | select(.auth_user and (.auth_user | index($u) != null)))' /etc/sing-box/config.json)" > /etc/sing-box/config.json
 
     if [[ -n $new_rule ]]
     then
-        insert_pos=$(jq '[.route.rules[] | has("outbound")] | index(true)' /etc/sing-box/config.json)
-        [[ "$insert_pos" == "null" ]] && insert_pos=$(jq '.route.rules | length' /etc/sing-box/config.json)
-        echo "$(jq ".route.rules |= (.[0:${insert_pos}] + [${new_rule}] + .[${insert_pos}:])" /etc/sing-box/config.json)" > /etc/sing-box/config.json
+        insert_pos=$(jq '[.route.rules[] | has("outbound")] | index(true)' /etc/sing-box/config.json 2>/dev/null)
+        [[ "$insert_pos" == "null" || -z "$insert_pos" ]] && insert_pos=$(jq '(.route.rules // []) | length' /etc/sing-box/config.json 2>/dev/null)
+        [[ "${insert_pos:-0}" -lt 2 ]] && insert_pos=2
+        echo "$(jq --argjson rule "${new_rule}" --argjson pos "${insert_pos}" '.route.rules |= (.[0:$pos] + [$rule] + .[$pos:])' /etc/sing-box/config.json)" > /etc/sing-box/config.json
     fi
 
     if sing-box check -c /etc/sing-box/config.json
     then
+        rm -f /etc/sing-box/config.json.bak-usermode
         systemctl reload sing-box.service
         echo -e "${info_message[1_$language]}"
         echo ""
     else
         cp -f /etc/sing-box/config.json.bak-usermode /etc/sing-box/config.json
+        rm -f /etc/sing-box/config.json.bak-usermode
         echo -e "${info_message[2_$language]}"
         echo ""
     fi
