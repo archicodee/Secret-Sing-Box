@@ -404,7 +404,7 @@ del_from_conf() {
     info_message[1_ru]="Пользователь ${textcolor}${username}${clear} удалён"
     info_message[1_en]="Deleted user ${textcolor}${username}${clear}"
 
-    echo "$(jq "del(.inbounds[].users[] | select(.name == \"${username}\"))" /etc/sing-box/config.json)" > /etc/sing-box/config.json
+    echo "$(jq --arg u "${username}" 'del(.inbounds[].users[] | select(.name == $u)) | del(.route.rules[] | select(.auth_user and (.auth_user | index($u) != null)))' /etc/sing-box/config.json)" > /etc/sing-box/config.json
     systemctl reload sing-box.service
 
     rm -f /var/www/${subspath}/${username}-TRJ-CLIENT.json /var/www/${subspath}/${username}-VLESS-CLIENT.json
@@ -510,6 +510,188 @@ change_stack() {
         get_stack_sel
         stack_text_${language}
         edit_configs_stack
+    done
+}
+
+### OPTION 20 - CHANGE ROUTING MODE OF A USER ###
+
+check_user_routing() {
+    declare -A -g check_message=()
+    check_message[1_ru]="${red}Ошибка: исходящий WARP не настроен на этом сервере${clear}"
+    check_message[1_en]="${red}Error: WARP outbound is not configured on this server${clear}"
+    check_message[2_ru]="${red}Ошибка: цепочка из двух и более серверов не настроена на этом сервере${clear}"
+    check_message[2_en]="${red}Error: a chain of two or more servers is not configured on this server${clear}"
+
+    has_warp=""
+    has_chain=""
+    [[ $(jq '[.outbounds[].tag] | index("warp")' /etc/sing-box/config.json) != "null" ]] && has_warp="true"
+    [[ $(jq '[.outbounds[].tag] | index("proxy")' /etc/sing-box/config.json) != "null" ]] && has_chain="true"
+}
+
+get_user_mode_sel() {
+    declare -A -g info_message=()
+    info_message[1_ru]="[Выбрано]"
+    info_message[1_en]="[Selected]"
+
+    check_user_routing
+
+    mode_sel_1=""; mode_sel_2=""; mode_sel_3=""; mode_sel_4=""; mode_sel_5=""; mode_sel_6=""; mode_sel_7=""
+
+    mode_rule=$(jq -c --arg u "${username}" '[.route.rules[] | select(.auth_user and (.auth_user | index($u) != null))] | .[0]' /etc/sing-box/config.json)
+
+    if [[ -n "$mode_rule" && "$mode_rule" != "null" ]]
+    then
+        mode_outbound=$(jq -r '.outbound' <<< "${mode_rule}")
+        mode_has_ru=$(jq 'has("domain_suffix")' <<< "${mode_rule}")
+
+        if [[ "$mode_has_ru" == "true" ]]
+        then
+            case $mode_outbound in
+                warp)   mode_sel_5="${info_message[1_$language]}" ;;
+                direct) mode_sel_6="${info_message[1_$language]}" ;;
+                proxy)  mode_sel_7="${info_message[1_$language]}" ;;
+            esac
+        else
+            case $mode_outbound in
+                warp)   mode_sel_2="${info_message[1_$language]}" ;;
+                direct) mode_sel_3="${info_message[1_$language]}" ;;
+                proxy)  mode_sel_4="${info_message[1_$language]}" ;;
+            esac
+        fi
+    else
+        mode_sel_1="${info_message[1_$language]}"
+    fi
+}
+
+user_mode_text_ru() {
+    echo -e "${textcolor}[?]${clear} Выберите режим маршрутизации для пользователя ${textcolor}${username}${clear}:"
+    echo "0 - Выйти"
+    echo "1 - По умолчанию (общие правила маршрутизации сервера)                          ${mode_sel_1}"
+    echo "2 - Полный WARP (весь трафик пользователя через WARP)                           ${mode_sel_2}"
+    echo "3 - Полный Direct (весь трафик пользователя напрямую с сервера)                 ${mode_sel_3}"
+    echo "4 - Полная цепочка (весь трафик пользователя через следующий сервер)            ${mode_sel_4}"
+    echo "5 - WARP для RU/SU/РФ (только российские домены через WARP)                     ${mode_sel_5}"
+    echo "6 - Direct для RU/SU/РФ (только российские домены напрямую с сервера)           ${mode_sel_6}"
+    echo "7 - Цепочка для RU/SU/РФ (только российские домены через следующий сервер)      ${mode_sel_7}"
+    read -r mode_option
+    [[ -n $mode_option ]] && echo ""
+}
+
+user_mode_text_en() {
+    echo -e "${textcolor}[?]${clear} Select a routing mode for the user ${textcolor}${username}${clear}:"
+    echo "0 - Exit"
+    echo "1 - Default (global routing rules of the server)                                ${mode_sel_1}"
+    echo "2 - Full WARP (all user traffic through WARP)                                   ${mode_sel_2}"
+    echo "3 - Full Direct (all user traffic direct from the server)                       ${mode_sel_3}"
+    echo "4 - Full Chain (all user traffic through the next server)                       ${mode_sel_4}"
+    echo "5 - WARP for RU/SU/RF (only Russian domains through WARP)                       ${mode_sel_5}"
+    echo "6 - Direct for RU/SU/RF (only Russian domains direct from the server)           ${mode_sel_6}"
+    echo "7 - Chain for RU/SU/RF (only Russian domains through the next server)           ${mode_sel_7}"
+    read -r mode_option
+    [[ -n $mode_option ]] && echo ""
+}
+
+get_user_mode() {
+    get_user_mode_sel
+
+    while true
+    do
+        user_mode_text_${language}
+
+        error_option=""
+        case $mode_option in
+            2|5)
+            [[ "$has_warp" != "true" ]] && error_option="1"
+            ;;
+            4|7)
+            [[ "$has_chain" != "true" ]] && error_option="2"
+            ;;
+            1|3|6)
+            ;;
+            *)
+            mode_option=""
+            main_menu
+            ;;
+        esac
+
+        if [[ -n $error_option ]]
+        then
+            echo -e "${check_message[${error_option}_$language]}"
+            echo ""
+            continue
+        fi
+        break
+    done
+}
+
+build_user_ru_rule() {
+    ru_sets=""
+    for ru_set in geoip-ru category-gov-ru ru-blocked
+    do
+        [[ $(jq --arg set "${ru_set}" '[.route.rule_set[].tag] | index($set) != null' /etc/sing-box/config.json) == "true" ]] && ru_sets+="\"${ru_set}\","
+    done
+    ru_sets=${ru_sets%,}
+
+    new_rule="{\"auth_user\":[\"${username}\"],\"domain_suffix\":[\".ru\",\".su\",\".ru.com\",\".ru.net\"],\"domain_keyword\":[\"xn--\"]"
+    [[ -n $ru_sets ]] && new_rule+=",\"rule_set\":[${ru_sets}]"
+    new_rule+=",\"outbound\":\"${new_outbound}\"}"
+}
+
+edit_user_routing() {
+    declare -A -g info_message=()
+    info_message[1_ru]="Режим маршрутизации пользователя ${textcolor}${username}${clear} изменён и применён на сервере"
+    info_message[1_en]="The routing mode of the user ${textcolor}${username}${clear} has been changed and applied on the server"
+    info_message[2_ru]="${red}Ошибка: проверка конфига завершилась с ошибкой, изменения отменены${clear}"
+    info_message[2_en]="${red}Error: config check failed, changes have been reverted${clear}"
+
+    new_rule=""
+    case $mode_option in
+        2) new_outbound="warp" ;;
+        3) new_outbound="direct" ;;
+        4) new_outbound="proxy" ;;
+        5) new_outbound="warp" ;;
+        6) new_outbound="direct" ;;
+        7) new_outbound="proxy" ;;
+        1) new_rule="" ;;
+    esac
+
+    if [[ $mode_option =~ ^(2|3|4)$ ]]
+    then
+        new_rule="{\"auth_user\":[\"${username}\"],\"outbound\":\"${new_outbound}\"}"
+    elif [[ $mode_option =~ ^(5|6|7)$ ]]
+    then
+        build_user_ru_rule
+    fi
+
+    cp -f /etc/sing-box/config.json /etc/sing-box/config.json.bak-usermode
+
+    echo "$(jq --arg u "${username}" 'del(.route.rules[] | select(.auth_user and (.auth_user | index($u) != null)))' /etc/sing-box/config.json)" > /etc/sing-box/config.json
+
+    if [[ -n $new_rule ]]
+    then
+        insert_pos=$(jq '[.route.rules[] | has("outbound")] | index(true)' /etc/sing-box/config.json)
+        [[ "$insert_pos" == "null" ]] && insert_pos=$(jq '.route.rules | length' /etc/sing-box/config.json)
+        echo "$(jq ".route.rules |= (.[0:${insert_pos}] + [${new_rule}] + .[${insert_pos}:])" /etc/sing-box/config.json)" > /etc/sing-box/config.json
+    fi
+
+    if sing-box check -c /etc/sing-box/config.json
+    then
+        systemctl reload sing-box.service
+        echo -e "${info_message[1_$language]}"
+        echo ""
+    else
+        cp -f /etc/sing-box/config.json.bak-usermode /etc/sing-box/config.json
+        echo -e "${info_message[2_$language]}"
+        echo ""
+    fi
+}
+
+change_user_routing() {
+    while [[ ! ${username,,} =~ ^(x|х)$ ]]
+    do
+        enter_user_data_del
+        get_user_mode
+        edit_user_routing
     done
 }
 
@@ -2477,6 +2659,7 @@ main_menu_text_ru() {
     echo "4 - Поменять \"stack\" в tun-интерфейсе у пользователя"
     echo "5 - Синхронизировать настройки во всех клиентских конфигах"
     echo "6 - Настроить на клиенте подключение к выбранному IP Cloudflare"
+    echo "20 - Поменять режим маршрутизации у пользователя"
     echo "---------------------------------"
     echo "7 - Вывести список доменов/суффиксов WARP"
     echo "8 - Добавить домен/суффикс в WARP"
@@ -2510,6 +2693,7 @@ main_menu_text_en() {
     echo "4 - Change \"stack\" in tun interface of the user"
     echo "5 - Sync settings in all client configs"
     echo "6 - Setup connection to custom Cloudflare IP on the client"
+    echo "20 - Change the routing mode of the user"
     echo "---------------------------------"
     echo "7 - Show the list of domains/suffixes routed through WARP"
     echo "8 - Add a new domain/suffix to WARP routing"
@@ -2595,6 +2779,9 @@ main_menu() {
         ;;
         4)
         change_stack
+        ;;
+        20)
+        change_user_routing
         ;;
         5)
         sync_client_configs

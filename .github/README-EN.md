@@ -38,6 +38,8 @@ Both setup methods make it impossible to detect Sing-Box from the outside, which
 10) Client Sing-Box configs (v1.11.0–1.13.X) with routing rules for Russia
 11) Automated management of user config files
 12) Page for convenient distribution of subscriptions ([example](https://a-zuro.github.io/Secret-Sing-Box/sub.html#en))
+13) Dedicated "User management" menu with per-user routing templates (WARP / Direct / Chain)
+14) Full uninstall option with config retention support
 
 ### Server setup:
 
@@ -68,11 +70,23 @@ Then follow the instructions:
 
 ![pic-2-en](https://github.com/user-attachments/assets/58ea4e4c-342a-4a8b-a18b-e4b5b987c50b)
 
-Option 5 synchronizes the settings in client configs of all users, which eliminates the need to edit the config of each user separately:
-
-5.1. Synchronizes settings with the [template from GitHub](../Config-Templates/client.json).
-
-5.2. Synchronizes settings with the local template, allows to set custom rules in client configs. If new rule sets are added to the configs by using this option, they will be automatically downloaded on the server if they are from [SagerNet](https://github.com/SagerNet/sing-geosite/tree/rule-set).
+#### 👥 User Management & Per-User Routing
+Option 1 opens the dedicated **"User management"** submenu, centralizing all user-specific controls:
+- **Show users**: displays the user list with each user's assigned routing template
+- **Add user / Delete user**: easily manage credentials and client configurations (deleting a user automatically cleans up routing rules)
+- **Change TUN stack**: switch between `system`, `gvisor`, or `mixed`
+- **Change routing template**: assign individualized routing templates per user:
+  - `Default`: follows the server's global routing rules
+  - `Full WARP`: routes all user traffic through WARP
+  - `Full Direct`: routes all user traffic directly from the server
+  - `Full Chain`: routes all user traffic through the next proxy server
+  - `WARP for RU/SU/RF`: routes only Russian domains for the user through WARP
+  - `Direct for RU/SU/RF`: routes only Russian domains for the user directly from the server
+  - `Chain for RU/SU/RF`: routes only Russian domains for the user through the next proxy server
+- **Custom Cloudflare IP**: configure client connections to specific Cloudflare CDN IPs
+- **Synchronize settings in client configs**: eliminates the need to edit each user config separately:
+  - Synchronizes settings with the [template from GitHub](../Config-Templates/client.json).
+  - Synchronizes settings with the local template, allows setting custom rules in client configs. If new rule sets are added to configs, they are automatically downloaded on the server if they are from [SagerNet](https://github.com/SagerNet/sing-geosite/tree/rule-set).
 
 ### WARP+ keys:
 
