@@ -172,18 +172,10 @@ check_local_template() {
     fi
 }
 
-### OPTION 1 - SHOW USERS ###
+### OPTION 1 - USER LIST & MANAGEMENT ###
 
 show_users() {
-    declare -A -g info_message=()
-    info_message[1_ru]="${textcolor}Количество пользователей:${clear}"
-    info_message[1_en]="${textcolor}Number of users:${clear}"
-
-    user_num=$(ls -A1 /var/www/${subspath} | grep "\-TRJ-CLIENT.json" | wc -l)
-    echo -e "${info_message[1_$language]} ${user_num}"
-    ls -A1 /var/www/${subspath} | grep "\-CLIENT.json" | sed -e "s/-TRJ-CLIENT\.json//g" -e "s/-VLESS-CLIENT\.json//g" | uniq
-    echo ""
-    main_menu
+    user_list_menu
 }
 
 ### OPTION 2 - ADD USERS ###
@@ -423,12 +415,7 @@ del_from_auth_lua() {
 }
 
 delete_users() {
-    while [[ ! ${username,,} =~ ^(x|х)$ ]]
-    do
-        enter_user_data_del
-        del_from_auth_lua
-        del_from_conf
-    done
+    user_list_menu
 }
 
 ### OPTION 4 - CHANGE STACK VALUE ###
@@ -455,7 +442,7 @@ get_stack_sel() {
 
 stack_text_ru() {
     echo -e "${textcolor}[?]${clear} Выберите \"stack\" для пользователя ${textcolor}${username}${clear}:"
-    echo "0 - Выйти"
+    echo "0 - Назад"
     echo "1 - \"system\" (системный стек, лучшая производительность, значение по умолчанию)    ${stack_sel_1}"
     echo "2 - \"gvisor\" (запускается в userspace, рекомендуется, если не работает \"system\")   ${stack_sel_2}"
     echo "3 - \"mixed\" (смешанный вариант: \"system\" для TCP, \"gvisor\" для UDP)                ${stack_sel_3}"
@@ -465,7 +452,7 @@ stack_text_ru() {
 
 stack_text_en() {
     echo -e "${textcolor}[?]${clear} Select \"stack\" value for the user ${textcolor}${username}${clear}:"
-    echo "0 - Exit"
+    echo "0 - Back"
     echo "1 - \"system\" (system stack, the best performance, default value)             ${stack_sel_1}"
     echo "2 - \"gvisor\" (runs in userspace, is recommended if \"system\" isn't working)   ${stack_sel_2}"
     echo "3 - \"mixed\" (mixed variant: \"system\" for TCP, \"gvisor\" for UDP)              ${stack_sel_3}"
@@ -489,28 +476,24 @@ edit_configs_stack() {
         new_stack="mixed"
         ;;
         *)
-        main_menu
+        return 1
+        ;;
     esac
 
     for protocol in 'TRJ' 'VLESS'
     do
         [[ "$protocol" == "VLESS" ]] && [[ -f /etc/haproxy/auth.lua ]] && break
-        inbound_num=$(jq '[.inbounds[].tag] | index("tun-in")' /var/www/${subspath}/${username}-${protocol}-CLIENT.json)
-        echo "$(jq ".inbounds[${inbound_num}].stack = \"${new_stack}\"" /var/www/${subspath}/${username}-${protocol}-CLIENT.json)" > /var/www/${subspath}/${username}-${protocol}-CLIENT.json
+        inbound_num=$(jq '[.inbounds[].tag] | index("tun-in")' /var/www/${subspath}/${username}-${protocol}-CLIENT.json 2>/dev/null)
+        [[ -n "$inbound_num" && "$inbound_num" != "null" ]] && echo "$(jq ".inbounds[${inbound_num}].stack = \"${new_stack}\"" /var/www/${subspath}/${username}-${protocol}-CLIENT.json)" > /var/www/${subspath}/${username}-${protocol}-CLIENT.json
     done
 
     echo -e "${info_message[1_$language]}"
     echo ""
+    return 0
 }
 
 change_stack() {
-    while [[ ! ${username,,} =~ ^(x|х)$ ]]
-    do
-        enter_user_data_del
-        get_stack_sel
-        stack_text_${language}
-        edit_configs_stack
-    done
+    user_list_menu
 }
 
 ### OPTION 20 - CHANGE ROUTING MODE OF A USER ###
@@ -521,6 +504,8 @@ check_user_routing() {
     check_message[1_en]="${red}Error: WARP outbound is not configured on this server${clear}"
     check_message[2_ru]="${red}Ошибка: цепочка из двух и более серверов не настроена на этом сервере${clear}"
     check_message[2_en]="${red}Error: a chain of two or more servers is not configured on this server${clear}"
+    check_message[3_ru]="${red}Ошибка: неверный выбор, введите число от 0 до 7${clear}"
+    check_message[3_en]="${red}Error: invalid choice, enter a number from 0 to 7${clear}"
 
     has_warp=""
     has_chain=""
@@ -565,7 +550,7 @@ get_user_mode_sel() {
 
 user_mode_text_ru() {
     echo -e "${textcolor}[?]${clear} Выберите режим маршрутизации для пользователя ${textcolor}${username}${clear}:"
-    echo "0 - Выйти"
+    echo "0 - Назад"
     echo "1 - По умолчанию (общие правила маршрутизации сервера)                          ${mode_sel_1}"
     echo "2 - Полный WARP (весь трафик пользователя через WARP)                           ${mode_sel_2}"
     echo "3 - Полный Direct (весь трафик пользователя напрямую с сервера)                 ${mode_sel_3}"
@@ -579,7 +564,7 @@ user_mode_text_ru() {
 
 user_mode_text_en() {
     echo -e "${textcolor}[?]${clear} Select a routing mode for the user ${textcolor}${username}${clear}:"
-    echo "0 - Exit"
+    echo "0 - Back"
     echo "1 - Default (global routing rules of the server)                                ${mode_sel_1}"
     echo "2 - Full WARP (all user traffic through WARP)                                   ${mode_sel_2}"
     echo "3 - Full Direct (all user traffic direct from the server)                       ${mode_sel_3}"
@@ -600,6 +585,9 @@ get_user_mode() {
 
         error_option=""
         case $mode_option in
+            0)
+            return 1
+            ;;
             2|5)
             [[ "$has_warp" != "true" ]] && error_option="1"
             ;;
@@ -609,8 +597,7 @@ get_user_mode() {
             1|3|6)
             ;;
             *)
-            mode_option=""
-            main_menu
+            error_option="3"
             ;;
         esac
 
@@ -620,7 +607,7 @@ get_user_mode() {
             echo ""
             continue
         fi
-        break
+        return 0
     done
 }
 
@@ -692,11 +679,238 @@ edit_user_routing() {
 }
 
 change_user_routing() {
-    while [[ ! ${username,,} =~ ^(x|х)$ ]]
+    user_list_menu
+}
+
+### USER MANAGEMENT: ACTIONS & SUBMENU ###
+
+user_manage_menu() {
+    declare -A -g um_title=()
+    um_title[ru]="${textcolor}Управление пользователем ${clear}${textcolor_light}${username}${clear}:"
+    um_title[en]="${textcolor}Managing user ${clear}${textcolor_light}${username}${clear}:"
+
+    declare -A -g um_stack_lbl=()
+    um_stack_lbl[ru]="  TUN stack: "
+    um_stack_lbl[en]="  TUN stack: "
+
+    declare -A -g um_route_lbl=()
+    um_route_lbl[ru]="  Маршрутизация: "
+    um_route_lbl[en]="  Routing: "
+
+    declare -A -g um_links_lbl=()
+    um_links_lbl[ru]="  Ссылки на конфигурации:"
+    um_links_lbl[en]="  Subscription links:"
+
+    declare -A -g um_actions_lbl=()
+    um_actions_lbl[ru]="${textcolor}Выберите действие:${clear}"
+    um_actions_lbl[en]="${textcolor}Select an action:${clear}"
+
+    declare -A -g um_opt0=() um_opt1=() um_opt2=() um_opt3=()
+    um_opt0[ru]="0 - Назад к списку пользователей"
+    um_opt0[en]="0 - Back to user list"
+    um_opt1[ru]="1 - Поменять \"stack\" в tun-интерфейсе"
+    um_opt1[en]="1 - Change \"stack\" in tun interface"
+    um_opt2[ru]="2 - Поменять режим маршрутизации"
+    um_opt2[en]="2 - Change routing mode"
+    um_opt3[ru]="3 - Удалить пользователя"
+    um_opt3[en]="3 - Delete user"
+
+    while true
     do
-        enter_user_data_del
-        get_user_mode
-        edit_user_routing
+        local cur_stack="system"
+        if [[ -f /var/www/${subspath}/${username}-TRJ-CLIENT.json ]]
+        then
+            local s
+            s=$(jq -r '.inbounds[] | select(.tag == "tun-in") | .stack' /var/www/${subspath}/${username}-TRJ-CLIENT.json 2>/dev/null)
+            [[ -n "$s" && "$s" != "null" ]] && cur_stack="$s"
+        fi
+
+        local cur_mode
+        local m_rule
+        m_rule=$(jq -c --arg uname "$username" '[.route.rules[] | select(.auth_user and (.auth_user | index($uname) != null))] | .[0]' /etc/sing-box/config.json 2>/dev/null)
+        if [[ -n "$m_rule" && "$m_rule" != "null" ]]
+        then
+            local m_out m_has_ru
+            m_out=$(jq -r '.outbound' <<< "$m_rule" 2>/dev/null)
+            m_has_ru=$(jq 'has("domain_suffix")' <<< "$m_rule" 2>/dev/null)
+            if [[ "$m_has_ru" == "true" ]]
+            then
+                [[ "$language" == "ru" ]] && cur_mode="${m_out^^} (только домены RU/SU/РФ)" || cur_mode="${m_out^^} (RU/SU/RF domains only)"
+            else
+                [[ "$language" == "ru" ]] && cur_mode="Полный ${m_out^^} (весь трафик)" || cur_mode="Full ${m_out^^} (all traffic)"
+            fi
+        else
+            [[ "$language" == "ru" ]] && cur_mode="По умолчанию (общие правила сервера)" || cur_mode="Default (global server rules)"
+        fi
+
+        echo ""
+        echo -e "${um_title[$language]}"
+        echo -e "${um_stack_lbl[$language]}${textcolor}${cur_stack}${clear}"
+        echo -e "${um_route_lbl[$language]}${textcolor}${cur_mode}${clear}"
+        echo -e "${um_links_lbl[$language]}"
+        echo "    https://${domain}/${subspath}/${username}-TRJ-CLIENT.json"
+        [[ ! -f /etc/haproxy/auth.lua ]] && echo "    https://${domain}/${subspath}/${username}-VLESS-CLIENT.json"
+        echo ""
+        echo -e "${um_actions_lbl[$language]}"
+        echo -e "${um_opt0[$language]}"
+        echo -e "${um_opt1[$language]}"
+        echo -e "${um_opt2[$language]}"
+        echo -e "${um_opt3[$language]}"
+        read -r um_action
+        [[ -n $um_action ]] && echo ""
+
+        case $um_action in
+            0|x|х)
+            username=""
+            user_list_menu
+            return
+            ;;
+            1)
+            get_stack_sel
+            stack_text_${language}
+            edit_configs_stack
+            ;;
+            2)
+            if get_user_mode
+            then
+                edit_user_routing
+            fi
+            ;;
+            3)
+            declare -A -g del_confirm_msg=()
+            del_confirm_msg[ru]="${textcolor}[?]${clear} Вы уверены, что хотите удалить пользователя ${textcolor}${username}${clear}? [y/N]:"
+            del_confirm_msg[en]="${textcolor}[?]${clear} Are you sure you want to delete user ${textcolor}${username}${clear}? [y/N]:"
+
+            echo -e "${del_confirm_msg[$language]}"
+            read -r confirm_del
+            [[ -n $confirm_del ]] && echo ""
+
+            if [[ ${confirm_del,,} =~ ^(y|yes|д|да)$ ]]
+            then
+                del_from_auth_lua
+                del_from_conf
+                username=""
+                user_list_menu
+                return
+            fi
+            ;;
+            *)
+            continue
+            ;;
+        esac
+    done
+}
+
+user_list_menu() {
+    local users_raw
+    users_raw=$(ls -A1 /var/www/${subspath} 2>/dev/null | grep "\-CLIENT.json" | sed -e "s/-TRJ-CLIENT\.json//g" -e "s/-VLESS-CLIENT\.json//g" | sort -u)
+
+    if [[ -z "$users_raw" ]]
+    then
+        declare -A -g no_users_msg=()
+        no_users_msg[ru]="${red}Ошибка: пользователи отсутствуют${clear}"
+        no_users_msg[en]="${red}Error: no users found${clear}"
+        echo -e "${no_users_msg[$language]}"
+        echo ""
+        main_menu
+        return
+    fi
+
+    local -a users_arr=()
+    while IFS= read -r u
+    do
+        [[ -n "$u" ]] && users_arr+=("$u")
+    done <<< "$users_raw"
+
+    local total_users=${#users_arr[@]}
+
+    declare -A -g ulist_title=()
+    ulist_title[ru]="${textcolor}Список пользователей (всего: ${total_users}):${clear}"
+    ulist_title[en]="${textcolor}User list (total: ${total_users}):${clear}"
+
+    declare -A -g ulist_back=()
+    ulist_back[ru]="0 - Назад в главное меню"
+    ulist_back[en]="0 - Back to main menu"
+
+    declare -A -g ulist_prompt=()
+    ulist_prompt[ru]="${textcolor}[?]${clear} Выберите пользователя (номер или имя) или 0 для возврата:"
+    ulist_prompt[en]="${textcolor}[?]${clear} Select a user (number or name) or 0 to go back:"
+
+    declare -A -g ulist_invalid=()
+    ulist_invalid[ru]="${red}Ошибка: пользователь не найден, попробуйте снова${clear}"
+    ulist_invalid[en]="${red}Error: user not found, please try again${clear}"
+
+    while true
+    do
+        echo ""
+        echo -e "${ulist_title[$language]}"
+        echo -e "${ulist_back[$language]}"
+        echo "---------------------------------"
+        for idx in "${!users_arr[@]}"
+        do
+            local u="${users_arr[$idx]}"
+            local num=$((idx + 1))
+            local u_stack="system"
+            if [[ -f /var/www/${subspath}/${u}-TRJ-CLIENT.json ]]
+            then
+                local s
+                s=$(jq -r '.inbounds[] | select(.tag == "tun-in") | .stack' /var/www/${subspath}/${u}-TRJ-CLIENT.json 2>/dev/null)
+                [[ -n "$s" && "$s" != "null" ]] && u_stack="$s"
+            fi
+
+            local u_mode="default"
+            local u_rule
+            u_rule=$(jq -c --arg uname "$u" '[.route.rules[] | select(.auth_user and (.auth_user | index($uname) != null))] | .[0]' /etc/sing-box/config.json 2>/dev/null)
+            if [[ -n "$u_rule" && "$u_rule" != "null" ]]
+            then
+                local u_out u_has_ru
+                u_out=$(jq -r '.outbound' <<< "$u_rule" 2>/dev/null)
+                u_has_ru=$(jq 'has("domain_suffix")' <<< "$u_rule" 2>/dev/null)
+                if [[ "$u_has_ru" == "true" ]]
+                then
+                    [[ "$language" == "ru" ]] && u_mode="${u_out} (RU)" || u_mode="${u_out} (RU)"
+                else
+                    [[ "$language" == "ru" ]] && u_mode="full ${u_out}" || u_mode="full ${u_out}"
+                fi
+            else
+                [[ "$language" == "ru" ]] && u_mode="по умолчанию" || u_mode="default"
+            fi
+            echo -e "${num} - ${textcolor}${u}${clear} \t[stack: ${u_stack}, route: ${u_mode}]"
+        done
+        echo ""
+        echo -e "${ulist_prompt[$language]}"
+        read -r user_sel
+        [[ -n $user_sel ]] && echo ""
+
+        if [[ "$user_sel" == "0" || ${user_sel,,} =~ ^(x|х|back|q)$ ]]
+        then
+            main_menu
+            return
+        fi
+
+        selected_user=""
+        if [[ "$user_sel" =~ ^[0-9]+$ ]] && [[ "$user_sel" -ge 1 && "$user_sel" -le "$total_users" ]]
+        then
+            selected_user="${users_arr[$((user_sel - 1))]}"
+        else
+            for u in "${users_arr[@]}"
+            do
+                if [[ "$user_sel" == "$u" ]]
+                then
+                    selected_user="$u"
+                    break
+                fi
+            done
+        fi
+
+        if [[ -n "$selected_user" ]]
+        then
+            username="$selected_user"
+            user_manage_menu
+            return
+        else
+            echo -e "${ulist_invalid[$language]}"
+        fi
     done
 }
 
@@ -2657,32 +2871,30 @@ main_menu_text_ru() {
     echo ""
     echo -e "${textcolor}Выберите действие:${clear}"
     echo "0 - Выйти"
-    echo "1 - Вывести список пользователей"
+    echo "1 - Список пользователей"
     echo "2 - Добавить нового пользователя"
-    echo "3 - Удалить пользователя"
     echo "---------------------------------"
-    echo "4 - Поменять \"stack\" в tun-интерфейсе у пользователя"
-    echo "5 - Синхронизировать настройки во всех клиентских конфигах"
-    echo "6 - Настроить на клиенте подключение к выбранному IP Cloudflare"
-    echo "20 - Поменять режим маршрутизации у пользователя"
+    echo "3 - Синхронизировать настройки во всех клиентских конфигах"
+    echo "4 - Настроить на клиенте подключение к выбранному IP Cloudflare"
     echo "---------------------------------"
-    echo "7 - Вывести список доменов/суффиксов WARP"
-    echo "8 - Добавить домен/суффикс в WARP"
-    echo "9 - Удалить домен/суффикс из WARP"
-    echo "10 - Настроить/убрать цепочку из двух и более серверов"
+    echo "5 - Вывести список доменов/суффиксов WARP"
+    echo "6 - Добавить домен/суффикс в WARP"
+    echo "7 - Удалить домен/суффикс из WARP"
     echo "---------------------------------"
-    echo "11 - Обновить сертификат вручную"
-    echo "12 - Сменить домен"
-    echo "13 - Поменять пути для ${paths_to_change}подписки и наборов правил"
+    echo "8 - Настроить/убрать цепочку из двух и более серверов"
     echo "---------------------------------"
-    echo "14 - Отключить IPv6 на сервере"
-    echo "15 - Включить IPv6 на сервере"
+    echo "9 - Обновить сертификат вручную"
+    echo "10 - Сменить домен"
+    echo "11 - Поменять пути для ${paths_to_change}подписки и наборов правил"
     echo "---------------------------------"
-    echo "16 - Показать пути до конфигов и других значимых файлов"
-    echo "17 - Обновить"
+    echo "12 - Отключить IPv6 на сервере"
+    echo "13 - Включить IPv6 на сервере"
     echo "---------------------------------"
-    echo "18 - Управление blacklist (сети обнаружения)"
-    echo "19 - Удалить Secret Sing-Box"
+    echo "14 - Показать пути до конфигов и других значимых файлов"
+    echo "15 - Обновить"
+    echo "---------------------------------"
+    echo "16 - Управление blacklist (сети обнаружения)"
+    echo "17 - Удалить Secret Sing-Box"
     read -r option
     [[ -n $option ]] && echo ""
 }
@@ -2691,32 +2903,30 @@ main_menu_text_en() {
     echo ""
     echo -e "${textcolor}Select an option:${clear}"
     echo "0 - Exit"
-    echo "1 - Show the list of users"
+    echo "1 - User list"
     echo "2 - Add a new user"
-    echo "3 - Delete a user"
     echo "---------------------------------"
-    echo "4 - Change \"stack\" in tun interface of the user"
-    echo "5 - Sync settings in all client configs"
-    echo "6 - Setup connection to custom Cloudflare IP on the client"
-    echo "20 - Change the routing mode of the user"
+    echo "3 - Sync settings in all client configs"
+    echo "4 - Setup connection to custom Cloudflare IP on the client"
     echo "---------------------------------"
-    echo "7 - Show the list of domains/suffixes routed through WARP"
-    echo "8 - Add a new domain/suffix to WARP routing"
-    echo "9 - Delete a domain/suffix from WARP routing"
-    echo "10 - Setup/remove a chain of two or more servers"
+    echo "5 - Show the list of domains/suffixes routed through WARP"
+    echo "6 - Add a new domain/suffix to WARP routing"
+    echo "7 - Delete a domain/suffix from WARP routing"
     echo "---------------------------------"
-    echo "11 - Renew certificate manually"
-    echo "12 - Change domain"
-    echo "13 - Change paths for ${paths_to_change}subscription and rule sets"
+    echo "8 - Setup/remove a chain of two or more servers"
     echo "---------------------------------"
-    echo "14 - Disable IPv6 on the server"
-    echo "15 - Enable IPv6 on the server"
+    echo "9 - Renew certificate manually"
+    echo "10 - Change domain"
+    echo "11 - Change paths for ${paths_to_change}subscription and rule sets"
     echo "---------------------------------"
-    echo "16 - Show paths to configs and other important files"
-    echo "17 - Update"
+    echo "12 - Disable IPv6 on the server"
+    echo "13 - Enable IPv6 on the server"
     echo "---------------------------------"
-    echo "18 - Blacklist management (detection networks)"
-    echo "19 - Uninstall Secret Sing-Box"
+    echo "14 - Show paths to configs and other important files"
+    echo "15 - Update"
+    echo "---------------------------------"
+    echo "16 - Blacklist management (detection networks)"
+    echo "17 - Uninstall Secret Sing-Box"
     read -r option
     [[ -n $option ]] && echo ""
 }
@@ -2774,63 +2984,54 @@ main_menu() {
 
     case $option in
         1)
-        show_users
+        user_list_menu
         ;;
         2)
         add_users
         ;;
         3)
-        delete_users
-        ;;
-        4)
-        change_stack
-        ;;
-        20)
-        change_user_routing
-        ;;
-        5)
         sync_client_configs
         ;;
-        6)
+        4)
         cf_ip_settings
         ;;
-        7)
+        5)
         show_warp_domains
         ;;
-        8)
+        6)
         add_warp_domains
         ;;
-        9)
+        7)
         delete_warp_domains
         ;;
-        10)
+        8)
         chain_setup
         ;;
-        11)
+        9)
         renew_cert
         ;;
-        12)
+        10)
         change_domain
         ;;
-        13)
+        11)
         change_paths
         ;;
-        14)
+        12)
         disable_ipv6
         ;;
-        15)
+        13)
         enable_ipv6
         ;;
-        16)
+        14)
         show_paths_${language}
         ;;
-        17)
+        15)
         update_ssb
         ;;
-        18)
+        16)
         manage_blacklist
         ;;
-        19)
+        17)
         uninstall_menu
         ;;
         *)

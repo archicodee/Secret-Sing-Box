@@ -70,23 +70,23 @@ Then follow the instructions:
 
 ![pic-2-en](https://github.com/user-attachments/assets/58ea4e4c-342a-4a8b-a18b-e4b5b987c50b)
 
-#### 👥 User Management & Per-User Routing
-Option 1 opens the dedicated **"User management"** submenu, centralizing all user-specific controls:
-- **Show users**: displays the user list with each user's assigned routing template
-- **Add user / Delete user**: easily manage credentials and client configurations (deleting a user automatically cleans up routing rules)
-- **Change TUN stack**: switch between `system`, `gvisor`, or `mixed`
-- **Change routing template**: assign individualized routing templates per user:
-  - `Default`: follows the server's global routing rules
-  - `Full WARP`: routes all user traffic through WARP
-  - `Full Direct`: routes all user traffic directly from the server
-  - `Full Chain`: routes all user traffic through the next proxy server
-  - `WARP for RU/SU/RF`: routes only Russian domains for the user through WARP
-  - `Direct for RU/SU/RF`: routes only Russian domains for the user directly from the server
-  - `Chain for RU/SU/RF`: routes only Russian domains for the user through the next proxy server
-- **Custom Cloudflare IP**: configure client connections to specific Cloudflare CDN IPs
-- **Synchronize settings in client configs**: eliminates the need to edit each user config separately:
-  - Synchronizes settings with the [template from GitHub](../Config-Templates/client.json).
-  - Synchronizes settings with the local template, allows setting custom rules in client configs. If new rule sets are added to configs, they are automatically downloaded on the server if they are from [SagerNet](https://github.com/SagerNet/sing-geosite/tree/rule-set).
+#### 👥 User List & User Management Submenu
+Option 1 opens the **User list** submenu:
+- Displays all registered users with numbered indexes, active TUN stack, and routing mode
+- Selecting a user opens their profile management submenu:
+  - **Change TUN stack**: switch between `system`, `gvisor`, or `mixed`
+  - **Change routing mode**: assign per-user routing rules:
+    - `Default`: follows the server's global routing rules
+    - `Full WARP`: routes all user traffic through WARP
+    - `Full Direct`: routes all user traffic directly from the server
+    - `Full Chain`: routes all user traffic through the next proxy server
+    - `WARP for RU/SU/RF`: routes only Russian domains for the user through WARP
+    - `Direct for RU/SU/RF`: routes only Russian domains for the user directly from the server
+    - `Chain for RU/SU/RF`: routes only Russian domains for the user through the next proxy server
+  - **Delete user**: safely removes user credentials, routing rules, and client files with a confirmation prompt
+- Option 2: **Add user**
+- Option 3: **Synchronize settings in client configs** (GitHub or local template)
+- Option 4: **Custom Cloudflare IP** setup for client configs
 
 ### WARP+ keys:
 
