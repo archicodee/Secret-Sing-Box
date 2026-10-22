@@ -70,23 +70,30 @@ Then follow the instructions:
 
 ![pic-2-en](https://github.com/user-attachments/assets/58ea4e4c-342a-4a8b-a18b-e4b5b987c50b)
 
-#### 👥 User List & User Management Submenu
+#### 👥 User Management & Outbound Nodes Submenu
 Option 1 opens the **User list** submenu:
-- Displays all registered users with numbered indexes, active TUN stack, and routing mode
+- Displays all registered users with numbered indexes, active TUN stack, assigned outbound node, and routing mode
 - Selecting a user opens their profile management submenu:
   - **Change TUN stack**: switch between `system`, `gvisor`, or `mixed`
+  - **Choose outbound node**: assign the user's exit node to the local server (`direct`) or any added external node/tunnel (e.g. `de-out`, `wg0-out`)
   - **Change routing mode**: assign per-user routing rules:
     - `Default`: follows the server's global routing rules
     - `Full WARP`: routes all user traffic through WARP
-    - `Full Direct`: routes all user traffic directly from the server
+    - `Full Direct / Node`: routes all user traffic through the user's assigned outbound node
     - `Full Chain`: routes all user traffic through the next proxy server
-    - `WARP for RU/SU/RF`: routes only Russian domains for the user through WARP
-    - `Direct for RU/SU/RF`: routes only Russian domains for the user directly from the server
-    - `Chain for RU/SU/RF`: routes only Russian domains for the user through the next proxy server
+    - `WARP for RU/SU/RF`: routes Russian domains through WARP, and remaining traffic through the user's outbound node
+    - `Direct / Node for RU/SU/RF`: routes Russian domains through the user's outbound node, and remaining traffic through WARP
+    - `Chain for RU/SU/RF`: routes Russian domains through proxy chain, and remaining traffic through the user's outbound node
   - **Delete user**: safely removes user credentials, routing rules, and client files with a confirmation prompt
-- Option 2: **Add user**
-- Option 3: **Synchronize settings in client configs** (GitHub or local template)
-- Option 4: **Custom Cloudflare IP** setup for client configs
+- Option 2: **Add a new user**
+- Option 3: **Outbound nodes management**
+  - View all outbound nodes and count of assigned users
+  - Add outbound via proxy link (`vless://`, `vmess://`, `trojan://`, `ss://`, `socks5://`, `http://`)
+  - Add outbound via local network interface / tunnel (e.g., WireGuard `wg0`, `tun0`)
+  - Add outbound manually (SOCKS5 / HTTP proxy)
+  - Delete custom outbound (safely reverting assigned users to server `direct`)
+- Option 4: **Synchronize settings in client configs** (GitHub or local template)
+- Option 5: **Custom Cloudflare IP** setup for client configs
 
 ### WARP+ keys:
 
@@ -100,7 +107,7 @@ warp-cli registration license CMD5m479-Y5hS6y79-U06c5mq9
 > [!IMPORTANT]
 > It is recommended to use Sing-Box app due to more complete routing settings, but you can also import the link to [Hiddify](https://github.com/hiddify/hiddify-app/releases/latest) app or use any client app based on Sing-Box or Clash/Mihomo cores.
 >
-> When using Sing-Box on some devices, "stack": "system" in tun interface settings in client configs might not work. In such cases, it is recommended to replace it with "gvisor" by using option 4 in the settings menu (see above).
+> When using Sing-Box on some devices, "stack": "system" in tun interface settings in client configs might not work. In such cases, it is recommended to replace it with "gvisor" in the User management submenu (option 1 in settings menu).
 >
 > In Hiddify settings, specify DNS > Outbound domain strategy > IPv4 only. If some apps are not proxied when using Hiddify: Settings > Inbound > Service mode > VPN.
 

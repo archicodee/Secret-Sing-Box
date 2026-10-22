@@ -56,16 +56,19 @@ extract_values() {
         transport=$(jq -r '.inbounds[] | select(.tag == "trojan-in") | .transport.type' /etc/sing-box/config.json)
     fi
 
-    if [[ $(jq 'any(.route.rules[]; .outbound == "warp")' /etc/sing-box/config.json) == "true" ]]
+    if [[ $(jq 'any(.route.rules[]; .outbound == "warp" and (has("auth_user") | not))' /etc/sing-box/config.json) == "true" ]]
     then
-        warp_domain_suffix=$(jq '.route.rules[] | select(.outbound == "warp") | .domain_suffix' /etc/sing-box/config.json)
-        warp_rule_set=$(jq '.route.rules[] | select(.outbound == "warp") | .rule_set' /etc/sing-box/config.json)
+        warp_domain_suffix=$(jq '.route.rules[] | select(.outbound == "warp" and (has("auth_user") | not)) | .domain_suffix' /etc/sing-box/config.json)
+        warp_rule_set=$(jq '.route.rules[] | select(.outbound == "warp" and (has("auth_user") | not)) | .rule_set' /etc/sing-box/config.json)
     fi
 
     if [[ $(jq 'any(.outbounds[]; .tag == "proxy")' /etc/sing-box/config.json) == "true" ]]
     then
         chain_outbound=$(jq '.outbounds[] | select(.tag == "proxy")' /etc/sing-box/config.json)
     fi
+
+    # Capture custom outbounds added by user
+    custom_outbounds=$(jq -c '[.outbounds[] | select(.tag != "direct" and .tag != "warp" and .tag != "proxy" and .tag != "IPv4" and .tag != "block")]' /etc/sing-box/config.json 2>/dev/null)
 
     # Capture old rule_set tags for preservation during update
     old_rule_sets=()
@@ -90,9 +93,15 @@ insert_values() {
 
     if [[ -n $warp_domain_suffix ]]
     then
-        warp_rule_num=$(jq '[.route.rules[].outbound] | index("warp")' /etc/sing-box/config.json)
+        warp_rule_num=$(jq '[.route.rules[] | (.outbound == "warp" and (has("auth_user") | not))] | index(true)' /etc/sing-box/config.json)
         echo "$(jq ".route.rules[${warp_rule_num}].domain_suffix |= ${warp_domain_suffix}" /etc/sing-box/config.json)" > /etc/sing-box/config.json
         [[ -n $warp_rule_set ]] && echo "$(jq ".route.rules[${warp_rule_num}].rule_set |= ${warp_rule_set}" /etc/sing-box/config.json)" > /etc/sing-box/config.json
+    fi
+
+    # Restore custom outbounds
+    if [[ -n "$custom_outbounds" && "$custom_outbounds" != "[]" && "$custom_outbounds" != "null" ]]
+    then
+        echo "$(jq --argjson co "$custom_outbounds" '.outbounds += $co' /etc/sing-box/config.json)" > /etc/sing-box/config.json
     fi
 
     if [[ -n $chain_outbound ]]
@@ -235,6 +244,9 @@ update_scripts() {
     grep -q "alias ssb=" /etc/bash.bashrc || echo "alias ssb='/usr/local/bin/sbmanager'" >> /etc/bash.bashrc   # Legacy
     grep -q "alias sudo=" /etc/bash.bashrc || echo "alias sudo='sudo '" >> /etc/bash.bashrc   # Legacy
     [[ ! $(crontab -l) =~ "PATH=" ]] && crontab -l | sed '1i PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin' | crontab -   # Legacy
+    if [[ -f /etc/secret-sing-box/user-routes ]]; then
+        /usr/local/bin/sbmanager --apply-routes >/dev/null 2>&1 || true
+    fi
     echo ""
 }
 

@@ -307,7 +307,12 @@ add_to_server_conf() {
         echo "$(jq ".inbounds[${inbound_num}].users += [${user_cred}]" /etc/sing-box/config.json)" > /etc/sing-box/config.json
     done
 
-    systemctl reload sing-box.service
+    mkdir -p /etc/secret-sing-box
+    touch /etc/secret-sing-box/user-routes
+    if ! grep -q "^${username}:" /etc/secret-sing-box/user-routes 2>/dev/null; then
+        echo "${username}:direct:default" >> /etc/secret-sing-box/user-routes
+    fi
+    apply_user_routing
 }
 
 add_to_client_conf() {
@@ -396,8 +401,11 @@ del_from_conf() {
     info_message[1_ru]="Пользователь ${textcolor}${username}${clear} удалён"
     info_message[1_en]="Deleted user ${textcolor}${username}${clear}"
 
-    echo "$(jq --arg u "${username}" 'del(.inbounds[].users[] | select(.name == $u)) | del(.route.rules[] | select(.auth_user and (.auth_user | index($u) != null)))' /etc/sing-box/config.json)" > /etc/sing-box/config.json
-    systemctl reload sing-box.service
+    echo "$(jq --arg u "${username}" 'del(.inbounds[].users[] | select(.name == $u))' /etc/sing-box/config.json)" > /etc/sing-box/config.json
+    if [[ -f /etc/secret-sing-box/user-routes ]]; then
+        sed -i "/^${username}:/d" /etc/secret-sing-box/user-routes
+    fi
+    apply_user_routing
 
     rm -f /var/www/${subspath}/${username}-TRJ-CLIENT.json /var/www/${subspath}/${username}-VLESS-CLIENT.json
     echo -e "${info_message[1_$language]}"
@@ -496,7 +504,490 @@ change_stack() {
     user_list_menu
 }
 
-### OPTION 20 - CHANGE ROUTING MODE OF A USER ###
+### USER ROUTING & OUTBOUND PERSISTENCE ###
+
+parse_proxy_link_py() {
+    local link="$1"
+    local tag="$2"
+    python3 - "$link" "$tag" << 'PYEOF'
+import urllib.parse
+import json
+import base64
+import sys
+
+def b64_decode(s):
+    s = s.replace("-", "+").replace("_", "/")
+    pad = len(s) % 4
+    if pad:
+        s += "=" * (4 - pad)
+    return base64.b64decode(s).decode("utf-8", errors="ignore")
+
+def parse(link, tag):
+    link = link.strip()
+    if link.startswith("vless://"):
+        parsed = urllib.parse.urlparse(link)
+        uuid = parsed.username
+        server = parsed.hostname
+        port = parsed.port or 443
+        qs = urllib.parse.parse_qs(parsed.query)
+        out = {"type": "vless", "tag": tag, "server": server, "server_port": int(port), "uuid": uuid}
+        flow = qs.get("flow", [None])[0]
+        if flow: out["flow"] = flow
+        security = qs.get("security", ["none"])[0]
+        if security in ("tls", "reality"):
+            tls_conf = {"enabled": True}
+            sni = qs.get("sni", [None])[0]
+            if sni: tls_conf["server_name"] = sni
+            fp = qs.get("fp", [None])[0]
+            if fp: tls_conf["utls"] = {"enabled": True, "fingerprint": fp}
+            alpn = qs.get("alpn", [None])[0]
+            if alpn: tls_conf["alpn"] = [x.strip() for x in alpn.split(",") if x.strip()]
+            insecure = qs.get("allowInsecure", ["0"])[0]
+            if insecure == "1": tls_conf["insecure"] = True
+            if security == "reality":
+                reality_conf = {"enabled": True}
+                pbk = qs.get("pbk", [None])[0]
+                if pbk: reality_conf["public_key"] = pbk
+                sid = qs.get("sid", [None])[0]
+                if sid: reality_conf["short_id"] = sid
+                tls_conf["reality"] = reality_conf
+            out["tls"] = tls_conf
+        transport_type = qs.get("type", ["tcp"])[0]
+        if transport_type == "ws":
+            ws_conf = {"type": "ws"}
+            path = qs.get("path", [None])[0]
+            if path: ws_conf["path"] = path
+            host = qs.get("host", [None])[0]
+            if host: ws_conf["headers"] = {"Host": host}
+            out["transport"] = ws_conf
+        elif transport_type == "grpc":
+            service_name = qs.get("serviceName", [None])[0]
+            grpc_conf = {"type": "grpc"}
+            if service_name: grpc_conf["service_name"] = service_name
+            out["transport"] = grpc_conf
+        elif transport_type == "httpupgrade":
+            httpup_conf = {"type": "httpupgrade"}
+            path = qs.get("path", [None])[0]
+            if path: httpup_conf["path"] = path
+            host = qs.get("host", [None])[0]
+            if host: httpup_conf["headers"] = {"Host": host}
+            out["transport"] = httpup_conf
+        packet_encoding = qs.get("packetEncoding", [None])[0]
+        if packet_encoding: out["packet_encoding"] = packet_encoding
+        return out
+    elif link.startswith("vmess://"):
+        raw = link[8:]
+        data = json.loads(b64_decode(raw))
+        out = {"type": "vmess", "tag": tag, "server": data.get("add"), "server_port": int(data.get("port")), "uuid": data.get("id"), "alter_id": int(data.get("aid", 0)), "security": "auto"}
+        if data.get("tls") == "tls":
+            tls_conf = {"enabled": True}
+            sni = data.get("sni") or data.get("host")
+            if sni: tls_conf["server_name"] = sni
+            fp = data.get("fp")
+            if fp: tls_conf["utls"] = {"enabled": True, "fingerprint": fp}
+            alpn = data.get("alpn")
+            if alpn: tls_conf["alpn"] = [x.strip() for x in alpn.split(",") if x.strip()]
+            out["tls"] = tls_conf
+        net = data.get("net", "tcp")
+        if net == "ws":
+            ws_conf = {"type": "ws"}
+            if data.get("path"): ws_conf["path"] = data.get("path")
+            if data.get("host"): ws_conf["headers"] = {"Host": data.get("host")}
+            out["transport"] = ws_conf
+        elif net == "grpc":
+            grpc_conf = {"type": "grpc"}
+            if data.get("path"): grpc_conf["service_name"] = data.get("path")
+            out["transport"] = grpc_conf
+        return out
+    elif link.startswith("trojan://"):
+        parsed = urllib.parse.urlparse(link)
+        qs = urllib.parse.parse_qs(parsed.query)
+        out = {"type": "trojan", "tag": tag, "server": parsed.hostname, "server_port": int(parsed.port or 443), "password": parsed.username or parsed.password or ""}
+        tls_conf = {"enabled": True}
+        sni = qs.get("sni", [None])[0] or qs.get("peer", [None])[0]
+        if sni: tls_conf["server_name"] = sni
+        fp = qs.get("fp", [None])[0]
+        if fp: tls_conf["utls"] = {"enabled": True, "fingerprint": fp}
+        alpn = qs.get("alpn", [None])[0]
+        if alpn: tls_conf["alpn"] = [x.strip() for x in alpn.split(",") if x.strip()]
+        out["tls"] = tls_conf
+        transport_type = qs.get("type", ["tcp"])[0]
+        if transport_type == "ws":
+            ws_conf = {"type": "ws"}
+            path = qs.get("path", [None])[0]
+            if path: ws_conf["path"] = path
+            host = qs.get("host", [None])[0]
+            if host: ws_conf["headers"] = {"Host": host}
+            out["transport"] = ws_conf
+        return out
+    elif link.startswith("ss://"):
+        raw = link[5:]
+        if "#" in raw: raw, _ = raw.split("#", 1)
+        if "@" in raw:
+            user_info, server_info = raw.split("@", 1)
+            if ":" in user_info:
+                method, password = user_info.split(":", 1)
+            else:
+                decoded = b64_decode(user_info)
+                method, password = decoded.split(":", 1)
+            server, port = server_info.split(":", 1)
+        else:
+            decoded = b64_decode(raw)
+            user_info, server_info = decoded.split("@", 1)
+            method, password = user_info.split(":", 1)
+            server, port = server_info.split(":", 1)
+        return {"type": "shadowsocks", "tag": tag, "server": server, "server_port": int(port), "method": method, "password": password}
+    elif link.startswith("socks5://") or link.startswith("socks://"):
+        parsed = urllib.parse.urlparse(link)
+        out = {"type": "socks", "tag": tag, "server": parsed.hostname, "server_port": int(parsed.port or 1080)}
+        if parsed.username: out["username"] = parsed.username
+        if parsed.password: out["password"] = parsed.password
+        return out
+    elif link.startswith("http://") or link.startswith("https://"):
+        parsed = urllib.parse.urlparse(link)
+        out = {"type": "http", "tag": tag, "server": parsed.hostname, "server_port": int(parsed.port or (443 if parsed.scheme == "https" else 80))}
+        if parsed.scheme == "https": out["tls"] = {"enabled": True}
+        if parsed.username: out["username"] = parsed.username
+        if parsed.password: out["password"] = parsed.password
+        return out
+    else:
+        raise ValueError("Unsupported link protocol scheme")
+
+try:
+    link = sys.argv[1]
+    tag = sys.argv[2]
+    res = parse(link, tag)
+    print(json.dumps(res))
+except Exception as e:
+    print(f"Parser error: {e}", file=sys.stderr)
+    sys.exit(1)
+PYEOF
+}
+
+get_user_node() {
+    local u="$1"
+    local match
+    match=$(grep "^${u}:" /etc/secret-sing-box/user-routes 2>/dev/null | head -n 1)
+    local u_node="direct"
+    if [[ -n "$match" ]]
+    then
+        local f2 f3
+        f2=$(echo "$match" | cut -d: -f2)
+        f3=$(echo "$match" | cut -d: -f3)
+        if [[ -n "$f3" ]]
+        then
+            u_node="$f2"
+        fi
+    fi
+    if [[ $(jq --arg t "$u_node" '[(.outbounds // [])[].tag] | index($t) != null' /etc/sing-box/config.json 2>/dev/null) != "true" ]]
+    then
+        u_node="direct"
+    fi
+    echo "$u_node"
+}
+
+get_user_mode_val() {
+    local u="$1"
+    local match
+    match=$(grep "^${u}:" /etc/secret-sing-box/user-routes 2>/dev/null | head -n 1)
+    local u_mode="default"
+    if [[ -n "$match" ]]
+    then
+        local f2 f3
+        f2=$(echo "$match" | cut -d: -f2)
+        f3=$(echo "$match" | cut -d: -f3)
+        if [[ -n "$f3" ]]
+        then
+            u_mode="$f3"
+        else
+            u_mode="$f2"
+        fi
+    else
+        local m_rule
+        m_rule=$(jq -c --arg uname "$u" '[.route.rules[] | select(.auth_user and (.auth_user | index($uname) != null))] | .[0]' /etc/sing-box/config.json 2>/dev/null)
+        if [[ -n "$m_rule" && "$m_rule" != "null" ]]
+        then
+            local m_out m_has_ru
+            m_out=$(jq -r '.outbound' <<< "$m_rule" 2>/dev/null)
+            m_has_ru=$(jq 'has("domain_suffix")' <<< "$m_rule" 2>/dev/null)
+            if [[ "$m_has_ru" == "true" ]]
+            then
+                case "$m_out" in
+                    warp)  u_mode="warp-ru" ;;
+                    proxy) u_mode="chain-ru" ;;
+                    *)     u_mode="direct-ru" ;;
+                esac
+            else
+                case "$m_out" in
+                    warp)  u_mode="full-warp" ;;
+                    proxy) u_mode="full-chain" ;;
+                    *)     u_mode="full-node" ;;
+                esac
+            fi
+        fi
+    fi
+    echo "$u_mode"
+}
+
+save_user_route() {
+    local u="$1"
+    local node="$2"
+    local mode="$3"
+    mkdir -p /etc/secret-sing-box
+    touch /etc/secret-sing-box/user-routes
+    sed -i "/^${u}:/d" /etc/secret-sing-box/user-routes
+    echo "${u}:${node}:${mode}" >> /etc/secret-sing-box/user-routes
+    apply_user_routing
+}
+
+apply_user_routing() {
+    local has_warp="" has_chain=""
+    [[ $(jq '[(.outbounds // [])[].tag] | index("warp") != null' /etc/sing-box/config.json 2>/dev/null) == "true" ]] && has_warp="true"
+    [[ $(jq '[(.outbounds // [])[].tag] | index("proxy") != null' /etc/sing-box/config.json 2>/dev/null) == "true" ]] && has_chain="true"
+
+    local existing_outbounds
+    existing_outbounds=$(jq -r '[(.outbounds // [])[].tag] | .[]' /etc/sing-box/config.json 2>/dev/null)
+
+    local ru_sets=""
+    for rs in geoip-ru category-gov-ru
+    do
+        if [[ $(jq --arg s "$rs" '[(.route.rule_set // [])[].tag] | index($s) != null' /etc/sing-box/config.json 2>/dev/null) == "true" ]]
+        then
+            ru_sets+="\"$rs\","
+        fi
+    done
+    ru_sets="${ru_sets%,}"
+
+    local valid_users
+    valid_users=$(jq -r '[(.inbounds[]?.users // [])[].name] | unique[]' /etc/sing-box/config.json 2>/dev/null)
+
+    local new_rules="[]"
+
+    _add_rule_json() {
+        local rule_obj="$1"
+        new_rules=$(jq --argjson r "$rule_obj" '. + [$r]' <<< "$new_rules")
+    }
+
+    _user_arr_json() {
+        local -n arr_ref=$1
+        printf '%s\n' "${arr_ref[@]}" | jq -R . | jq -s .
+    }
+
+    declare -A mode_groups=()
+
+    for u in $valid_users
+    do
+        local match
+        match=$(grep "^${u}:" /etc/secret-sing-box/user-routes 2>/dev/null | head -n 1)
+        local u_node="direct"
+        local u_mode="default"
+
+        if [[ -n "$match" ]]
+        then
+            local f2 f3
+            f2=$(echo "$match" | cut -d: -f2)
+            f3=$(echo "$match" | cut -d: -f3)
+            if [[ -n "$f3" ]]
+            then
+                u_node="$f2"
+                u_mode="$f3"
+            else
+                u_node="direct"
+                u_mode="$f2"
+            fi
+        fi
+
+        if ! grep -qw "$u_node" <<< "$existing_outbounds"
+        then
+            u_node="direct"
+        fi
+
+        local key="${u_node}###${u_mode}"
+        mode_groups["$key"]+="${u} "
+    done
+
+    for key in "${!mode_groups[@]}"
+    do
+        local node="${key%%###*}"
+        local mode="${key##*###}"
+        local users_str="${mode_groups[$key]}"
+        read -r -a users_list <<< "$users_str"
+        [[ ${#users_list[@]} -eq 0 ]] && continue
+
+        local uj
+        uj=$(_user_arr_json users_list)
+
+        case "$mode" in
+            default)
+                if [[ "$node" != "direct" ]]
+                then
+                    _add_rule_json "{\"auth_user\":$uj,\"outbound\":\"$node\"}"
+                fi
+                ;;
+            full-node|full-direct)
+                _add_rule_json "{\"auth_user\":$uj,\"outbound\":\"$node\"}"
+                ;;
+            full-warp)
+                if [[ "$has_warp" == "true" ]]
+                then
+                    _add_rule_json "{\"auth_user\":$uj,\"outbound\":\"warp\"}"
+                else
+                    _add_rule_json "{\"auth_user\":$uj,\"outbound\":\"$node\"}"
+                fi
+                ;;
+            warp-ru)
+                if [[ "$has_warp" == "true" ]]
+                then
+                    local r="{\"auth_user\":$uj,\"domain_suffix\":[\".ru\",\".su\",\".ru.com\",\".ru.net\"],\"domain_keyword\":[\"xn--\"]"
+                    [[ -n "$ru_sets" ]] && r+=",\"rule_set\":[$ru_sets]"
+                    r+=",\"outbound\":\"warp\"}"
+                    _add_rule_json "$r"
+                fi
+                if [[ "$node" != "direct" ]]
+                then
+                    _add_rule_json "{\"auth_user\":$uj,\"outbound\":\"$node\"}"
+                fi
+                ;;
+            direct-ru)
+                local r="{\"auth_user\":$uj,\"domain_suffix\":[\".ru\",\".su\",\".ru.com\",\".ru.net\"],\"domain_keyword\":[\"xn--\"]"
+                [[ -n "$ru_sets" ]] && r+=",\"rule_set\":[$ru_sets]"
+                r+=",\"outbound\":\"$node\"}"
+                _add_rule_json "$r"
+
+                if [[ "$has_warp" == "true" ]]
+                then
+                    _add_rule_json "{\"auth_user\":$uj,\"outbound\":\"warp\"}"
+                fi
+                ;;
+            full-chain)
+                if [[ "$has_chain" == "true" ]]
+                then
+                    _add_rule_json "{\"auth_user\":$uj,\"outbound\":\"proxy\"}"
+                else
+                    _add_rule_json "{\"auth_user\":$uj,\"outbound\":\"$node\"}"
+                fi
+                ;;
+            chain-ru)
+                if [[ "$has_chain" == "true" ]]
+                then
+                    local r="{\"auth_user\":$uj,\"domain_suffix\":[\".ru\",\".su\",\".ru.com\",\".ru.net\"],\"domain_keyword\":[\"xn--\"]"
+                    [[ -n "$ru_sets" ]] && r+=",\"rule_set\":[$ru_sets]"
+                    r+=",\"outbound\":\"proxy\"}"
+                    _add_rule_json "$r"
+                fi
+                if [[ "$node" != "direct" ]]
+                then
+                    _add_rule_json "{\"auth_user\":$uj,\"outbound\":\"$node\"}"
+                fi
+                ;;
+        esac
+    done
+
+    cp -f /etc/sing-box/config.json /etc/sing-box/config.json.bak-routing
+
+    local updated_json
+    updated_json=$(jq --argjson new_rules "$new_rules" '
+        del(.route.rules[] | select(has("auth_user"))) |
+        ([.route.rules[] | (.outbound != null and (has("auth_user") | not))] | index(true)) as $pos |
+        ($pos // (.route.rules | length)) as $insert_pos |
+        .route.rules |= (.[0:$insert_pos] + $new_rules + .[$insert_pos:])
+    ' /etc/sing-box/config.json)
+
+    echo "$updated_json" > /etc/sing-box/config.json
+
+    local check_ok=""
+    if command -v sing-box >/dev/null 2>&1; then
+        sing-box check -c /etc/sing-box/config.json >/dev/null 2>&1 && check_ok="true"
+    else
+        jq . /etc/sing-box/config.json >/dev/null 2>&1 && check_ok="true"
+    fi
+
+    if [[ "$check_ok" == "true" ]]; then
+        rm -f /etc/sing-box/config.json.bak-routing
+        systemctl reload sing-box.service 2>/dev/null || true
+        return 0
+    else
+        cp -f /etc/sing-box/config.json.bak-routing /etc/sing-box/config.json
+        rm -f /etc/sing-box/config.json.bak-routing
+        echo -e "${red}Error: failed sing-box config validation for user routing, changes reverted${clear}"
+        return 1
+    fi
+}
+
+select_user_outbound() {
+    declare -A -g su_title=()
+    su_title[ru]="${textcolor}[?]${clear} Выберите выходную ноду (Outbound) для пользователя ${textcolor}${username}${clear}:"
+    su_title[en]="${textcolor}[?]${clear} Select an outbound node for user ${textcolor}${username}${clear}:"
+
+    local cur_node
+    cur_node=$(get_user_node "$username")
+    local cur_mode
+    cur_mode=$(get_user_mode_val "$username")
+
+    local cand_nodes=("direct")
+    for t in $(jq -r '.outbounds[]?.tag' /etc/sing-box/config.json 2>/dev/null); do
+        if [[ "$t" != "direct" && "$t" != "warp" && "$t" != "proxy" && "$t" != "IPv4" && "$t" != "block" && -n "$t" ]]; then
+            cand_nodes+=("$t")
+        fi
+    done
+
+    while true
+    do
+        echo ""
+        echo -e "${su_title[$language]}"
+        echo "0 - Назад"
+        for idx in "${!cand_nodes[@]}"; do
+            local num=$((idx + 1))
+            local tag="${cand_nodes[$idx]}"
+            local sel_mark=""
+            [[ "$tag" == "$cur_node" ]] && sel_mark=" ${info_message[1_$language]}"
+
+            local desc=""
+            if [[ "$tag" == "direct" ]]; then
+                [[ "$language" == "ru" ]] && desc="(Локальный сервер / Прямой выход)" || desc="(Local server / Direct)"
+            else
+                local otype osrv oport oiface
+                otype=$(jq -r --arg t "$tag" '.outbounds[] | select(.tag == $t) | .type' /etc/sing-box/config.json 2>/dev/null)
+                osrv=$(jq -r --arg t "$tag" '.outbounds[] | select(.tag == $t) | .server // empty' /etc/sing-box/config.json 2>/dev/null)
+                oport=$(jq -r --arg t "$tag" '.outbounds[] | select(.tag == $t) | .server_port // empty' /etc/sing-box/config.json 2>/dev/null)
+                oiface=$(jq -r --arg t "$tag" '.outbounds[] | select(.tag == $t) | .bind_interface // empty' /etc/sing-box/config.json 2>/dev/null)
+                if [[ -n "$osrv" ]]; then
+                    desc="(${otype}, ${osrv}:${oport})"
+                elif [[ -n "$oiface" ]]; then
+                    desc="(${otype}, interface: ${oiface})"
+                else
+                    desc="(${otype})"
+                fi
+            fi
+            echo -e "${num} - ${textcolor}${tag}${clear} ${desc}${sel_mark}"
+        done
+
+        read -r node_sel
+        [[ -n $node_sel ]] && echo ""
+
+        if [[ "$node_sel" == "0" || ${node_sel,,} =~ ^(x|х|back|q)$ ]]; then
+            return 0
+        fi
+
+        if [[ "$node_sel" =~ ^[0-9]+$ ]] && [[ "$node_sel" -ge 1 && "$node_sel" -le "${#cand_nodes[@]}" ]]; then
+            local chosen_node="${cand_nodes[$((node_sel - 1))]}"
+            save_user_route "$username" "$chosen_node" "$cur_mode"
+            declare -A -g su_success=()
+            su_success[ru]="Выходная нода пользователя ${textcolor}${username}${clear} изменена на ${textcolor}${chosen_node}${clear}"
+            su_success[en]="Outbound node of user ${textcolor}${username}${clear} changed to ${textcolor}${chosen_node}${clear}"
+            echo -e "${su_success[$language]}"
+            echo ""
+            return 0
+        else
+            declare -A -g su_invalid=()
+            su_invalid[ru]="${red}Ошибка: неверный выбор, попробуйте снова${clear}"
+            su_invalid[en]="${red}Error: invalid choice, please try again${clear}"
+            echo -e "${su_invalid[$language]}"
+        fi
+    done
+}
+
+### ROUTING MODE SELECTION FOR A USER ###
 
 check_user_routing() {
     declare -A -g check_message=()
@@ -509,8 +1000,8 @@ check_user_routing() {
 
     has_warp=""
     has_chain=""
-    [[ $(jq '[.outbounds[].tag] | index("warp")' /etc/sing-box/config.json) != "null" ]] && has_warp="true"
-    [[ $(jq '[.outbounds[].tag] | index("proxy")' /etc/sing-box/config.json) != "null" ]] && has_chain="true"
+    [[ $(jq '[.outbounds[].tag] | index("warp")' /etc/sing-box/config.json 2>/dev/null) != "null" ]] && has_warp="true"
+    [[ $(jq '[.outbounds[].tag] | index("proxy")' /etc/sing-box/config.json 2>/dev/null) != "null" ]] && has_chain="true"
 }
 
 get_user_mode_sel() {
@@ -521,57 +1012,55 @@ get_user_mode_sel() {
     check_user_routing
 
     mode_sel_1=""; mode_sel_2=""; mode_sel_3=""; mode_sel_4=""; mode_sel_5=""; mode_sel_6=""; mode_sel_7=""
+    local cur_mode
+    cur_mode=$(get_user_mode_val "$username")
 
-    mode_rule=$(jq -c --arg u "${username}" '[.route.rules[] | select(.auth_user and (.auth_user | index($u) != null))] | .[0]' /etc/sing-box/config.json)
-
-    if [[ -n "$mode_rule" && "$mode_rule" != "null" ]]
-    then
-        mode_outbound=$(jq -r '.outbound' <<< "${mode_rule}")
-        mode_has_ru=$(jq 'has("domain_suffix")' <<< "${mode_rule}")
-
-        if [[ "$mode_has_ru" == "true" ]]
-        then
-            case $mode_outbound in
-                warp)   mode_sel_5="${info_message[1_$language]}" ;;
-                direct) mode_sel_6="${info_message[1_$language]}" ;;
-                proxy)  mode_sel_7="${info_message[1_$language]}" ;;
-            esac
-        else
-            case $mode_outbound in
-                warp)   mode_sel_2="${info_message[1_$language]}" ;;
-                direct) mode_sel_3="${info_message[1_$language]}" ;;
-                proxy)  mode_sel_4="${info_message[1_$language]}" ;;
-            esac
-        fi
-    else
-        mode_sel_1="${info_message[1_$language]}"
-    fi
+    case "$cur_mode" in
+        default)               mode_sel_1="${info_message[1_$language]}" ;;
+        full-warp)             mode_sel_2="${info_message[1_$language]}" ;;
+        full-node|full-direct) mode_sel_3="${info_message[1_$language]}" ;;
+        full-chain)            mode_sel_4="${info_message[1_$language]}" ;;
+        warp-ru)               mode_sel_5="${info_message[1_$language]}" ;;
+        direct-ru)             mode_sel_6="${info_message[1_$language]}" ;;
+        chain-ru)              mode_sel_7="${info_message[1_$language]}" ;;
+        *)                     mode_sel_1="${info_message[1_$language]}" ;;
+    esac
 }
 
 user_mode_text_ru() {
-    echo -e "${textcolor}[?]${clear} Выберите режим маршрутизации для пользователя ${textcolor}${username}${clear}:"
+    local cur_node
+    cur_node=$(get_user_node "$username")
+    local node_label="Direct (сервер)"
+    [[ "$cur_node" != "direct" ]] && node_label="$cur_node"
+
+    echo -e "${textcolor}[?]${clear} Выберите режим маршрутизации для пользователя ${textcolor}${username}${clear} (нода: ${textcolor}${cur_node}${clear}):"
     echo "0 - Назад"
     echo "1 - По умолчанию (общие правила маршрутизации сервера)                          ${mode_sel_1}"
     echo "2 - Полный WARP (весь трафик пользователя через WARP)                           ${mode_sel_2}"
-    echo "3 - Полный Direct (весь трафик пользователя напрямую с сервера)                 ${mode_sel_3}"
+    echo "3 - Полный ${node_label} (весь трафик пользователя через ${cur_node})          ${mode_sel_3}"
     echo "4 - Полная цепочка (весь трафик пользователя через следующий сервер)            ${mode_sel_4}"
-    echo "5 - WARP для RU/SU/РФ (только российские домены через WARP)                     ${mode_sel_5}"
-    echo "6 - Direct для RU/SU/РФ (только российские домены напрямую с сервера)           ${mode_sel_6}"
-    echo "7 - Цепочка для RU/SU/РФ (только российские домены через следующий сервер)      ${mode_sel_7}"
+    echo "5 - WARP для RU/SU/РФ (RU через WARP, остальное через ${cur_node})              ${mode_sel_5}"
+    echo "6 - ${node_label} для RU/SU/РФ (RU через ${cur_node}, остальное через WARP)     ${mode_sel_6}"
+    echo "7 - Цепочка для RU/SU/РФ (RU через цепочку, остальное через ${cur_node})        ${mode_sel_7}"
     read -r mode_option
     [[ -n $mode_option ]] && echo ""
 }
 
 user_mode_text_en() {
-    echo -e "${textcolor}[?]${clear} Select a routing mode for the user ${textcolor}${username}${clear}:"
+    local cur_node
+    cur_node=$(get_user_node "$username")
+    local node_label="Direct (server)"
+    [[ "$cur_node" != "direct" ]] && node_label="$cur_node"
+
+    echo -e "${textcolor}[?]${clear} Select a routing mode for the user ${textcolor}${username}${clear} (node: ${textcolor}${cur_node}${clear}):"
     echo "0 - Back"
     echo "1 - Default (global routing rules of the server)                                ${mode_sel_1}"
     echo "2 - Full WARP (all user traffic through WARP)                                   ${mode_sel_2}"
-    echo "3 - Full Direct (all user traffic direct from the server)                       ${mode_sel_3}"
+    echo "3 - Full ${node_label} (all user traffic through ${cur_node})                   ${mode_sel_3}"
     echo "4 - Full Chain (all user traffic through the next server)                       ${mode_sel_4}"
-    echo "5 - WARP for RU/SU/RF (only Russian domains through WARP)                       ${mode_sel_5}"
-    echo "6 - Direct for RU/SU/RF (only Russian domains direct from the server)           ${mode_sel_6}"
-    echo "7 - Chain for RU/SU/RF (only Russian domains through the next server)           ${mode_sel_7}"
+    echo "5 - WARP for RU/SU/RF (RU through WARP, rest through ${cur_node})              ${mode_sel_5}"
+    echo "6 - ${node_label} for RU/SU/RF (RU through ${cur_node}, rest through WARP)     ${mode_sel_6}"
+    echo "7 - Chain for RU/SU/RF (RU through chain, rest through ${cur_node})             ${mode_sel_7}"
     read -r mode_option
     [[ -n $mode_option ]] && echo ""
 }
@@ -611,71 +1100,28 @@ get_user_mode() {
     done
 }
 
-build_user_ru_rule() {
-    ru_sets=$(jq -c '([(.route.rule_set // [])[].tag]) as $existing | ["geoip-ru", "category-gov-ru"] | map(select(. as $s | $existing | index($s) != null))' /etc/sing-box/config.json 2>/dev/null)
-    [[ -z "$ru_sets" ]] && ru_sets="[]"
-
-    new_rule=$(jq -cn --arg u "${username}" --arg o "${new_outbound}" --argjson sets "${ru_sets}" '{auth_user: [$u], domain_suffix: [".ru", ".su", ".ru.com", ".ru.net"], domain_keyword: ["xn--"]} + (if ($sets | length) > 0 then {rule_set: $sets} else {} end) + {outbound: $o}')
-}
-
 edit_user_routing() {
-    declare -A -g info_message=()
-    info_message[1_ru]="Режим маршрутизации пользователя ${textcolor}${username}${clear} изменён и применён на сервере"
-    info_message[1_en]="The routing mode of the user ${textcolor}${username}${clear} has been changed and applied on the server"
-    info_message[2_ru]="${red}Ошибка: проверка конфига завершилась с ошибкой, изменения отменены${clear}"
-    info_message[2_en]="${red}Error: config check failed, changes have been reverted${clear}"
-    info_message[3_ru]="${red}Ошибка: не удалось создать резервную копию конфига, изменения не применены${clear}"
-    info_message[3_en]="${red}Error: failed to create a config backup, changes have not been applied${clear}"
+    local cur_node
+    cur_node=$(get_user_node "$username")
+    local chosen_mode="default"
 
-    new_rule=""
     case $mode_option in
-        2) new_outbound="warp" ;;
-        3) new_outbound="direct" ;;
-        4) new_outbound="proxy" ;;
-        5) new_outbound="warp" ;;
-        6) new_outbound="direct" ;;
-        7) new_outbound="proxy" ;;
-        1) new_rule="" ;;
+        1) chosen_mode="default" ;;
+        2) chosen_mode="full-warp" ;;
+        3) chosen_mode="full-node" ;;
+        4) chosen_mode="full-chain" ;;
+        5) chosen_mode="warp-ru" ;;
+        6) chosen_mode="direct-ru" ;;
+        7) chosen_mode="chain-ru" ;;
     esac
 
-    if [[ $mode_option =~ ^(2|3|4)$ ]]
-    then
-        new_rule=$(jq -cn --arg u "${username}" --arg o "${new_outbound}" '{auth_user: [$u], outbound: $o}')
-    elif [[ $mode_option =~ ^(5|6|7)$ ]]
-    then
-        build_user_ru_rule
-    fi
+    save_user_route "$username" "$cur_node" "$chosen_mode"
 
-    if ! cp -f /etc/sing-box/config.json /etc/sing-box/config.json.bak-usermode
-    then
-        echo -e "${info_message[3_$language]}"
-        echo ""
-        main_menu
-        return 1
-    fi
-
-    echo "$(jq --arg u "${username}" 'del(.route.rules[] | select(.auth_user and (.auth_user | index($u) != null)))' /etc/sing-box/config.json)" > /etc/sing-box/config.json
-
-    if [[ -n $new_rule ]]
-    then
-        insert_pos=$(jq '[.route.rules[] | has("outbound")] | index(true)' /etc/sing-box/config.json 2>/dev/null)
-        [[ "$insert_pos" == "null" || -z "$insert_pos" ]] && insert_pos=$(jq '(.route.rules // []) | length' /etc/sing-box/config.json 2>/dev/null)
-        [[ "${insert_pos:-0}" -lt 2 ]] && insert_pos=2
-        echo "$(jq --argjson rule "${new_rule}" --argjson pos "${insert_pos}" '.route.rules |= (.[0:$pos] + [$rule] + .[$pos:])' /etc/sing-box/config.json)" > /etc/sing-box/config.json
-    fi
-
-    if sing-box check -c /etc/sing-box/config.json
-    then
-        rm -f /etc/sing-box/config.json.bak-usermode
-        systemctl reload sing-box.service
-        echo -e "${info_message[1_$language]}"
-        echo ""
-    else
-        cp -f /etc/sing-box/config.json.bak-usermode /etc/sing-box/config.json
-        rm -f /etc/sing-box/config.json.bak-usermode
-        echo -e "${info_message[2_$language]}"
-        echo ""
-    fi
+    declare -A -g ur_info=()
+    ur_info[ru]="Режим маршрутизации пользователя ${textcolor}${username}${clear} успешно изменён и применён на сервере"
+    ur_info[en]="The routing mode of the user ${textcolor}${username}${clear} has been changed and applied on the server"
+    echo -e "${ur_info[$language]}"
+    echo ""
 }
 
 change_user_routing() {
@@ -690,12 +1136,16 @@ user_manage_menu() {
     um_title[en]="${textcolor}Managing user ${clear}${textcolor_light}${username}${clear}:"
 
     declare -A -g um_stack_lbl=()
-    um_stack_lbl[ru]="  TUN stack: "
-    um_stack_lbl[en]="  TUN stack: "
+    um_stack_lbl[ru]="  TUN stack:     "
+    um_stack_lbl[en]="  TUN stack:     "
+
+    declare -A -g um_node_lbl=()
+    um_node_lbl[ru]="  Выходная нода: "
+    um_node_lbl[en]="  Outbound node: "
 
     declare -A -g um_route_lbl=()
     um_route_lbl[ru]="  Маршрутизация: "
-    um_route_lbl[en]="  Routing: "
+    um_route_lbl[en]="  Routing mode:  "
 
     declare -A -g um_links_lbl=()
     um_links_lbl[ru]="  Ссылки на конфигурации:"
@@ -705,15 +1155,17 @@ user_manage_menu() {
     um_actions_lbl[ru]="${textcolor}Выберите действие:${clear}"
     um_actions_lbl[en]="${textcolor}Select an action:${clear}"
 
-    declare -A -g um_opt0=() um_opt1=() um_opt2=() um_opt3=()
+    declare -A -g um_opt0=() um_opt1=() um_opt2=() um_opt3=() um_opt4=()
     um_opt0[ru]="0 - Назад к списку пользователей"
     um_opt0[en]="0 - Back to user list"
     um_opt1[ru]="1 - Поменять \"stack\" в tun-интерфейсе"
     um_opt1[en]="1 - Change \"stack\" in tun interface"
-    um_opt2[ru]="2 - Поменять режим маршрутизации"
-    um_opt2[en]="2 - Change routing mode"
-    um_opt3[ru]="3 - Удалить пользователя"
-    um_opt3[en]="3 - Delete user"
+    um_opt2[ru]="2 - Выбрать выходную ноду (Outbound)"
+    um_opt2[en]="2 - Choose outbound node"
+    um_opt3[ru]="3 - Поменять режим маршрутизации"
+    um_opt3[en]="3 - Change routing mode"
+    um_opt4[ru]="4 - Удалить пользователя"
+    um_opt4[en]="4 - Delete user"
 
     while true
     do
@@ -725,28 +1177,61 @@ user_manage_menu() {
             [[ -n "$s" && "$s" != "null" ]] && cur_stack="$s"
         fi
 
-        local cur_mode
-        local m_rule
-        m_rule=$(jq -c --arg uname "$username" '[.route.rules[] | select(.auth_user and (.auth_user | index($uname) != null))] | .[0]' /etc/sing-box/config.json 2>/dev/null)
-        if [[ -n "$m_rule" && "$m_rule" != "null" ]]
-        then
-            local m_out m_has_ru
-            m_out=$(jq -r '.outbound' <<< "$m_rule" 2>/dev/null)
-            m_has_ru=$(jq 'has("domain_suffix")' <<< "$m_rule" 2>/dev/null)
-            if [[ "$m_has_ru" == "true" ]]
-            then
-                [[ "$language" == "ru" ]] && cur_mode="${m_out^^} (только домены RU/SU/РФ)" || cur_mode="${m_out^^} (RU/SU/RF domains only)"
-            else
-                [[ "$language" == "ru" ]] && cur_mode="Полный ${m_out^^} (весь трафик)" || cur_mode="Full ${m_out^^} (all traffic)"
-            fi
+        local cur_node
+        cur_node=$(get_user_node "$username")
+        local node_desc=""
+        if [[ "$cur_node" == "direct" ]]; then
+            [[ "$language" == "ru" ]] && node_desc="direct (Локальный сервер)" || node_desc="direct (Local server)"
         else
-            [[ "$language" == "ru" ]] && cur_mode="По умолчанию (общие правила сервера)" || cur_mode="Default (global server rules)"
+            local ntype nsrv nport niface
+            ntype=$(jq -r --arg t "$cur_node" '.outbounds[] | select(.tag == $t) | .type' /etc/sing-box/config.json 2>/dev/null)
+            nsrv=$(jq -r --arg t "$cur_node" '.outbounds[] | select(.tag == $t) | .server // empty' /etc/sing-box/config.json 2>/dev/null)
+            nport=$(jq -r --arg t "$cur_node" '.outbounds[] | select(.tag == $t) | .server_port // empty' /etc/sing-box/config.json 2>/dev/null)
+            niface=$(jq -r --arg t "$cur_node" '.outbounds[] | select(.tag == $t) | .bind_interface // empty' /etc/sing-box/config.json 2>/dev/null)
+            if [[ -n "$nsrv" ]]; then
+                node_desc="${cur_node} (${ntype}, ${nsrv}:${nport})"
+            elif [[ -n "$niface" ]]; then
+                node_desc="${cur_node} (${ntype}, iface: ${niface})"
+            else
+                node_desc="${cur_node} (${ntype})"
+            fi
         fi
+
+        local cur_mode_val
+        cur_mode_val=$(get_user_mode_val "$username")
+        local cur_mode_str=""
+        case "$cur_mode_val" in
+            default)
+                [[ "$language" == "ru" ]] && cur_mode_str="По умолчанию (общие правила сервера)" || cur_mode_str="Default (global server rules)"
+                ;;
+            full-node|full-direct)
+                [[ "$language" == "ru" ]] && cur_mode_str="Полный ${cur_node} (весь трафик)" || cur_mode_str="Full ${cur_node} (all traffic)"
+                ;;
+            full-warp)
+                [[ "$language" == "ru" ]] && cur_mode_str="Полный WARP (весь трафик)" || cur_mode_str="Full WARP (all traffic)"
+                ;;
+            full-chain)
+                [[ "$language" == "ru" ]] && cur_mode_str="Полная цепочка (весь трафик)" || cur_mode_str="Full Chain (all traffic)"
+                ;;
+            warp-ru)
+                [[ "$language" == "ru" ]] && cur_mode_str="WARP (RU/SU/РФ) -> ${cur_node} (остальное)" || cur_mode_str="WARP (RU/SU/RF) -> ${cur_node} (rest)"
+                ;;
+            direct-ru)
+                [[ "$language" == "ru" ]] && cur_mode_str="${cur_node} (RU/SU/РФ) -> WARP (остальное)" || cur_mode_str="${cur_node} (RU/SU/RF) -> WARP (rest)"
+                ;;
+            chain-ru)
+                [[ "$language" == "ru" ]] && cur_mode_str="Цепочка (RU/SU/РФ) -> ${cur_node} (остальное)" || cur_mode_str="Chain (RU/SU/RF) -> ${cur_node} (rest)"
+                ;;
+            *)
+                [[ "$language" == "ru" ]] && cur_mode_str="По умолчанию" || cur_mode_str="Default"
+                ;;
+        esac
 
         echo ""
         echo -e "${um_title[$language]}"
         echo -e "${um_stack_lbl[$language]}${textcolor}${cur_stack}${clear}"
-        echo -e "${um_route_lbl[$language]}${textcolor}${cur_mode}${clear}"
+        echo -e "${um_node_lbl[$language]}${textcolor}${node_desc}${clear}"
+        echo -e "${um_route_lbl[$language]}${textcolor}${cur_mode_str}${clear}"
         echo -e "${um_links_lbl[$language]}"
         echo "    https://${domain}/${subspath}/${username}-TRJ-CLIENT.json"
         [[ ! -f /etc/haproxy/auth.lua ]] && echo "    https://${domain}/${subspath}/${username}-VLESS-CLIENT.json"
@@ -756,6 +1241,7 @@ user_manage_menu() {
         echo -e "${um_opt1[$language]}"
         echo -e "${um_opt2[$language]}"
         echo -e "${um_opt3[$language]}"
+        echo -e "${um_opt4[$language]}"
         read -r um_action
         [[ -n $um_action ]] && echo ""
 
@@ -771,12 +1257,15 @@ user_manage_menu() {
             edit_configs_stack
             ;;
             2)
+            select_user_outbound
+            ;;
+            3)
             if get_user_mode
             then
                 edit_user_routing
             fi
             ;;
-            3)
+            4)
             declare -A -g del_confirm_msg=()
             del_confirm_msg[ru]="${textcolor}[?]${clear} Вы уверены, что хотите удалить пользователя ${textcolor}${username}${clear}? [y/N]:"
             del_confirm_msg[en]="${textcolor}[?]${clear} Are you sure you want to delete user ${textcolor}${username}${clear}? [y/N]:"
@@ -858,24 +1347,24 @@ user_list_menu() {
                 [[ -n "$s" && "$s" != "null" ]] && u_stack="$s"
             fi
 
-            local u_mode="default"
-            local u_rule
-            u_rule=$(jq -c --arg uname "$u" '[.route.rules[] | select(.auth_user and (.auth_user | index($uname) != null))] | .[0]' /etc/sing-box/config.json 2>/dev/null)
-            if [[ -n "$u_rule" && "$u_rule" != "null" ]]
-            then
-                local u_out u_has_ru
-                u_out=$(jq -r '.outbound' <<< "$u_rule" 2>/dev/null)
-                u_has_ru=$(jq 'has("domain_suffix")' <<< "$u_rule" 2>/dev/null)
-                if [[ "$u_has_ru" == "true" ]]
-                then
-                    [[ "$language" == "ru" ]] && u_mode="${u_out} (RU)" || u_mode="${u_out} (RU)"
-                else
-                    [[ "$language" == "ru" ]] && u_mode="full ${u_out}" || u_mode="full ${u_out}"
-                fi
-            else
-                [[ "$language" == "ru" ]] && u_mode="по умолчанию" || u_mode="default"
-            fi
-            echo -e "${num} - ${textcolor}${u}${clear} \t[stack: ${u_stack}, route: ${u_mode}]"
+            local u_node
+            u_node=$(get_user_node "$u")
+
+            local u_mode_val
+            u_mode_val=$(get_user_mode_val "$u")
+            local u_mode_short=""
+            case "$u_mode_val" in
+                default)               u_mode_short="default" ;;
+                full-warp)             u_mode_short="WARP" ;;
+                full-node|full-direct) u_mode_short="${u_node}" ;;
+                full-chain)            u_mode_short="chain" ;;
+                warp-ru)               u_mode_short="WARP (RU)" ;;
+                direct-ru)             u_mode_short="${u_node} (RU)" ;;
+                chain-ru)              u_mode_short="chain (RU)" ;;
+                *)                     u_mode_short="default" ;;
+            esac
+
+            echo -e "${num} - ${textcolor}${u}${clear} \t[stack: ${u_stack}, node: ${u_node}, route: ${u_mode_short}]"
         done
         echo ""
         echo -e "${ulist_prompt[$language]}"
@@ -911,6 +1400,441 @@ user_list_menu() {
         else
             echo -e "${ulist_invalid[$language]}"
         fi
+    done
+}
+
+### OPTION 3 - OUTBOUND NODES MANAGEMENT ###
+
+show_outbounds_table() {
+    local tags
+    tags=$(jq -r '.outbounds[]?.tag' /etc/sing-box/config.json 2>/dev/null)
+
+    if [[ -z "$tags" ]]; then
+        echo "  (Нет настроенных outbounds)"
+        return
+    fi
+
+    declare -A user_counts=()
+    declare -A user_lists=()
+    local valid_users
+    valid_users=$(jq -r '[(.inbounds[]?.users // [])[].name] | unique[]' /etc/sing-box/config.json 2>/dev/null)
+
+    for u in $valid_users; do
+        local n
+        n=$(get_user_node "$u")
+        user_counts["$n"]=$(( ${user_counts["$n"]:-0} + 1 ))
+        user_lists["$n"]+="${u} "
+    done
+
+    local idx=1
+    for t in $tags; do
+        local otype osrv oport oiface
+        otype=$(jq -r --arg t "$t" '.outbounds[] | select(.tag == $t) | .type' /etc/sing-box/config.json 2>/dev/null)
+        osrv=$(jq -r --arg t "$t" '.outbounds[] | select(.tag == $t) | .server // empty' /etc/sing-box/config.json 2>/dev/null)
+        oport=$(jq -r --arg t "$t" '.outbounds[] | select(.tag == $t) | .server_port // empty' /etc/sing-box/config.json 2>/dev/null)
+        oiface=$(jq -r --arg t "$t" '.outbounds[] | select(.tag == $t) | .bind_interface // empty' /etc/sing-box/config.json 2>/dev/null)
+
+        local role_label=""
+        case "$t" in
+            direct) role_label="[Системный / Локальный]" ;;
+            warp)   role_label="[Cloudflare WARP]" ;;
+            proxy)  role_label="[Цепочка серверов]" ;;
+            IPv4)   role_label="[IPv4 Only]" ;;
+            block)  role_label="[Блокировка]" ;;
+            *)      role_label="[Пользовательский]" ;;
+        esac
+
+        local u_info=""
+        local cnt=${user_counts["$t"]:-0}
+        if [[ "$t" != "warp" && "$t" != "proxy" && "$t" != "IPv4" && "$t" != "block" ]]; then
+            local ulist="${user_lists["$t"]:-}"
+            ulist="${ulist%" "}"
+            if [[ "$cnt" -gt 0 ]]; then
+                u_info="— пользователей: ${cnt} (${ulist})"
+            else
+                u_info="— пользователей: 0"
+            fi
+        fi
+
+        local target_str=""
+        if [[ -n "$osrv" ]]; then
+            target_str="(${osrv}:${oport})"
+        elif [[ -n "$oiface" ]]; then
+            target_str="(интерфейс: ${oiface})"
+        fi
+
+        printf "  %-12s %-12s %-26s %-24s %s\n" "[${idx}] ${t}" "(${otype})" "${target_str}" "${role_label}" "${u_info}"
+        idx=$((idx + 1))
+    done
+}
+
+add_outbound_by_link() {
+    declare -A -g aol_msgs=()
+    aol_msgs[tag_prompt_ru]="${textcolor}[?]${clear} Введите имя (тег) для нового outbound (например: de или de-out) или x для отмены:"
+    aol_msgs[tag_prompt_en]="${textcolor}[?]${clear} Enter a name (tag) for the new outbound (e.g., de or de-out) or x to cancel:"
+    aol_msgs[link_prompt_ru]="${textcolor}[?]${clear} Вставьте ссылку (vless://, vmess://, trojan://, ss://, socks5://, http://) или x для отмены:"
+    aol_msgs[link_prompt_en]="${textcolor}[?]${clear} Paste proxy link (vless://, vmess://, trojan://, ss://, socks5://, http://) or x to cancel:"
+    aol_msgs[err_tag_ru]="${red}Ошибка: тег может содержать только латинские буквы, цифры, дефис и подчеркивание${clear}"
+    aol_msgs[err_tag_en]="${red}Error: tag may only contain alphanumeric characters, dash, and underscore${clear}"
+    aol_msgs[err_exists_ru]="${red}Ошибка: outbound с таким тегом уже существует${clear}"
+    aol_msgs[err_exists_en]="${red}Error: an outbound with this tag already exists${clear}"
+    aol_msgs[success_ru]="Outbound ${textcolor}%s${clear} успешно добавлен на сервер!"
+    aol_msgs[success_en]="Outbound ${textcolor}%s${clear} successfully added to the server!"
+    aol_msgs[err_parse_ru]="${red}Ошибка: не удалось распарсить ссылку. Проверьте формат ссылки.${clear}"
+    aol_msgs[err_parse_en]="${red}Error: failed to parse proxy link. Please verify link format.${clear}"
+    aol_msgs[err_check_ru]="${red}Ошибка: sing-box check отклонил конфигурацию с этим outbound. Изменения отменены.${clear}"
+    aol_msgs[err_check_en]="${red}Error: sing-box check rejected config with this outbound. Changes reverted.${clear}"
+
+    local new_tag=""
+    while true; do
+        echo -e "${aol_msgs[tag_prompt_$language]}"
+        read -r new_tag
+        [[ -n $new_tag ]] && echo ""
+        [[ ${new_tag,,} =~ ^(x|х|q)$ || -z "$new_tag" ]] && return 0
+        new_tag=$(echo "$new_tag" | tr -d '[:space:]')
+        if [[ ! $new_tag =~ ^[a-zA-Z0-9._-]+$ ]]; then
+            echo -e "${aol_msgs[err_tag_$language]}"
+            continue
+        fi
+        [[ "$new_tag" != *-out ]] && new_tag="${new_tag}-out"
+
+        if [[ $(jq --arg t "$new_tag" '[(.outbounds // [])[].tag] | index($t) != null' /etc/sing-box/config.json 2>/dev/null) == "true" ]]; then
+            echo -e "${aol_msgs[err_exists_$language]}"
+            continue
+        fi
+        break
+    done
+
+    echo -e "${aol_msgs[link_prompt_$language]}"
+    read -r proxy_link
+    [[ -n $proxy_link ]] && echo ""
+    [[ ${proxy_link,,} =~ ^(x|х|q)$ || -z "$proxy_link" ]] && return 0
+
+    local parsed_json
+    parsed_json=$(parse_proxy_link_py "$proxy_link" "$new_tag" 2>&1)
+    if [[ $? -ne 0 || -z "$parsed_json" ]] || ! echo "$parsed_json" | jq . >/dev/null 2>&1; then
+        echo -e "${aol_msgs[err_parse_$language]}"
+        echo "Details: $parsed_json"
+        echo ""
+        return 1
+    fi
+
+    cp -f /etc/sing-box/config.json /etc/sing-box/config.json.bak-outbound
+    echo "$(jq --argjson o "$parsed_json" '.outbounds += [$o]' /etc/sing-box/config.json)" > /etc/sing-box/config.json
+
+    local check_ok=""
+    if command -v sing-box >/dev/null 2>&1; then
+        sing-box check -c /etc/sing-box/config.json >/dev/null 2>&1 && check_ok="true"
+    else
+        jq . /etc/sing-box/config.json >/dev/null 2>&1 && check_ok="true"
+    fi
+
+    if [[ "$check_ok" == "true" ]]; then
+        rm -f /etc/sing-box/config.json.bak-outbound
+        systemctl reload sing-box.service 2>/dev/null || true
+        printf "${aol_msgs[success_$language]}\n" "$new_tag"
+        echo ""
+    else
+        cp -f /etc/sing-box/config.json.bak-outbound /etc/sing-box/config.json
+        rm -f /etc/sing-box/config.json.bak-outbound
+        echo -e "${aol_msgs[err_check_$language]}"
+        echo ""
+        return 1
+    fi
+}
+
+add_outbound_by_interface() {
+    declare -A -g aoi_msgs=()
+    aoi_msgs[iface_prompt_ru]="${textcolor}[?]${clear} Введите имя сетевого интерфейса (например: wg0, tun0, tailscale0) или x для отмены:"
+    aoi_msgs[iface_prompt_en]="${textcolor}[?]${clear} Enter network interface name (e.g., wg0, tun0, tailscale0) or x to cancel:"
+    aoi_msgs[tag_prompt_ru]="${textcolor}[?]${clear} Введите тег для outbound [нажмите Enter для %s]:"
+    aoi_msgs[tag_prompt_en]="${textcolor}[?]${clear} Enter tag for outbound [press Enter for %s]:"
+    aoi_msgs[warn_iface_ru]="${yellow}Внимание: интерфейс '%s' не обнаружен в системе (ip link). Продолжить? [y/N]:${clear}"
+    aoi_msgs[warn_iface_en]="${yellow}Warning: interface '%s' not found on system (ip link). Continue anyway? [y/N]:${clear}"
+    aoi_msgs[err_exists_ru]="${red}Ошибка: outbound с таким тегом уже существует${clear}"
+    aoi_msgs[err_exists_en]="${red}Error: an outbound with this tag already exists${clear}"
+    aoi_msgs[success_ru]="Интерфейс-outbound ${textcolor}%s${clear} успешно добавлен на сервер!"
+    aoi_msgs[success_en]="Interface outbound ${textcolor}%s${clear} successfully added to the server!"
+
+    echo -e "${aoi_msgs[iface_prompt_$language]}"
+    read -r iface_name
+    [[ -n $iface_name ]] && echo ""
+    [[ ${iface_name,,} =~ ^(x|х|q)$ || -z "$iface_name" ]] && return 0
+    iface_name=$(echo "$iface_name" | tr -d '[:space:]')
+
+    if ! ip link show "$iface_name" >/dev/null 2>&1; then
+        printf "${aoi_msgs[warn_iface_$language]}\n" "$iface_name"
+        read -r iface_confirm
+        [[ -n $iface_confirm ]] && echo ""
+        [[ ! ${iface_confirm,,} =~ ^(y|yes|д|да)$ ]] && return 0
+    fi
+
+    local def_tag="${iface_name}-out"
+    printf "${aoi_msgs[tag_prompt_$language]}\n" "$def_tag"
+    read -r iface_tag
+    [[ -n $iface_tag ]] && echo ""
+    [[ -z "$iface_tag" ]] && iface_tag="$def_tag"
+    iface_tag=$(echo "$iface_tag" | tr -d '[:space:]')
+    [[ "$iface_tag" != *-out ]] && iface_tag="${iface_tag}-out"
+
+    if [[ $(jq --arg t "$iface_tag" '[(.outbounds // [])[].tag] | index($t) != null' /etc/sing-box/config.json 2>/dev/null) == "true" ]]; then
+        echo -e "${aoi_msgs[err_exists_$language]}"
+        echo ""
+        return 1
+    fi
+
+    local iface_json
+    iface_json=$(jq -cn --arg t "$iface_tag" --arg iface "$iface_name" '{type: "direct", tag: $t, bind_interface: $iface}')
+
+    cp -f /etc/sing-box/config.json /etc/sing-box/config.json.bak-outbound
+    echo "$(jq --argjson o "$iface_json" '.outbounds += [$o]' /etc/sing-box/config.json)" > /etc/sing-box/config.json
+
+    local check_ok=""
+    if command -v sing-box >/dev/null 2>&1; then
+        sing-box check -c /etc/sing-box/config.json >/dev/null 2>&1 && check_ok="true"
+    else
+        jq . /etc/sing-box/config.json >/dev/null 2>&1 && check_ok="true"
+    fi
+
+    if [[ "$check_ok" == "true" ]]; then
+        rm -f /etc/sing-box/config.json.bak-outbound
+        systemctl reload sing-box.service 2>/dev/null || true
+        printf "${aoi_msgs[success_$language]}\n" "$iface_tag"
+        echo ""
+    else
+        cp -f /etc/sing-box/config.json.bak-outbound /etc/sing-box/config.json
+        rm -f /etc/sing-box/config.json.bak-outbound
+        echo -e "${aol_msgs[err_check_$language]}"
+        echo ""
+        return 1
+    fi
+}
+
+add_outbound_manually() {
+    declare -A -g aom_msgs=()
+    aom_msgs[proto_prompt_ru]="${textcolor}[?]${clear} Выберите тип прокси:\n1 - SOCKS5\n2 - HTTP\n0 - Отмена"
+    aom_msgs[proto_prompt_en]="${textcolor}[?]${clear} Select proxy type:\n1 - SOCKS5\n2 - HTTP\n0 - Cancel"
+    aom_msgs[host_prompt_ru]="${textcolor}[?]${clear} Введите IP или домен сервера:"
+    aom_msgs[host_prompt_en]="${textcolor}[?]${clear} Enter server IP or domain:"
+    aom_msgs[port_prompt_ru]="${textcolor}[?]${clear} Введите порт:"
+    aom_msgs[port_prompt_en]="${textcolor}[?]${clear} Enter port:"
+    aom_msgs[user_prompt_ru]="${textcolor}[?]${clear} Введите имя пользователя (или нажмите Enter, если без пароля):"
+    aom_msgs[user_prompt_en]="${textcolor}[?]${clear} Enter username (or press Enter if no auth):"
+    aom_msgs[pass_prompt_ru]="${textcolor}[?]${clear} Введите пароль:"
+    aom_msgs[pass_prompt_en]="${textcolor}[?]${clear} Enter password:"
+    aom_msgs[tag_prompt_ru]="${textcolor}[?]${clear} Введите тег (например: custom-proxy или proxy-out):"
+    aom_msgs[tag_prompt_en]="${textcolor}[?]${clear} Enter tag (e.g., custom-proxy or proxy-out):"
+    aom_msgs[success_ru]="Outbound ${textcolor}%s${clear} успешно добавлен на сервер!"
+    aom_msgs[success_en]="Outbound ${textcolor}%s${clear} successfully added to the server!"
+
+    echo -e "${aom_msgs[proto_prompt_$language]}"
+    read -r proto_sel
+    [[ -n $proto_sel ]] && echo ""
+    local o_type="socks"
+    case "$proto_sel" in
+        1) o_type="socks" ;;
+        2) o_type="http" ;;
+        *) return 0 ;;
+    esac
+
+    echo -e "${aom_msgs[host_prompt_$language]}"
+    read -r m_host
+    [[ -n $m_host ]] && echo ""
+    [[ -z "$m_host" ]] && return 0
+
+    echo -e "${aom_msgs[port_prompt_$language]}"
+    read -r m_port
+    [[ -n $m_port ]] && echo ""
+    [[ ! "$m_port" =~ ^[0-9]+$ ]] && return 0
+
+    echo -e "${aom_msgs[user_prompt_$language]}"
+    read -r m_user
+    [[ -n $m_user ]] && echo ""
+
+    local m_pass=""
+    if [[ -n "$m_user" ]]; then
+        echo -e "${aom_msgs[pass_prompt_$language]}"
+        read -r m_pass
+        [[ -n $m_pass ]] && echo ""
+    fi
+
+    echo -e "${aom_msgs[tag_prompt_$language]}"
+    read -r m_tag
+    [[ -n $m_tag ]] && echo ""
+    [[ -z "$m_tag" ]] && return 0
+    m_tag=$(echo "$m_tag" | tr -d '[:space:]')
+    [[ "$m_tag" != *-out ]] && m_tag="${m_tag}-out"
+
+    if [[ $(jq --arg t "$m_tag" '[(.outbounds // [])[].tag] | index($t) != null' /etc/sing-box/config.json 2>/dev/null) == "true" ]]; then
+        echo -e "${aol_msgs[err_exists_$language]}"
+        echo ""
+        return 1
+    fi
+
+    local m_json
+    m_json=$(jq -cn --arg t "$m_tag" --arg tp "$o_type" --arg s "$m_host" --argjson p "$m_port" --arg u "$m_user" --arg pw "$m_pass" '
+        {type: $tp, tag: $t, server: $s, server_port: $p} +
+        (if ($u | length) > 0 then {username: $u} else {} end) +
+        (if ($pw | length) > 0 then {password: $pw} else {} end)
+    ')
+
+    cp -f /etc/sing-box/config.json /etc/sing-box/config.json.bak-outbound
+    echo "$(jq --argjson o "$m_json" '.outbounds += [$o]' /etc/sing-box/config.json)" > /etc/sing-box/config.json
+
+    local check_ok=""
+    if command -v sing-box >/dev/null 2>&1; then
+        sing-box check -c /etc/sing-box/config.json >/dev/null 2>&1 && check_ok="true"
+    else
+        jq . /etc/sing-box/config.json >/dev/null 2>&1 && check_ok="true"
+    fi
+
+    if [[ "$check_ok" == "true" ]]; then
+        rm -f /etc/sing-box/config.json.bak-outbound
+        systemctl reload sing-box.service 2>/dev/null || true
+        printf "${aom_msgs[success_$language]}\n" "$m_tag"
+        echo ""
+    else
+        cp -f /etc/sing-box/config.json.bak-outbound /etc/sing-box/config.json
+        rm -f /etc/sing-box/config.json.bak-outbound
+        echo -e "${aol_msgs[err_check_$language]}"
+        echo ""
+        return 1
+    fi
+}
+
+delete_custom_outbound() {
+    declare -A -g dco_msgs=()
+    dco_msgs[no_custom_ru]="Нет добавленных пользовательских outbound для удаления"
+    dco_msgs[no_custom_en]="No custom outbounds available to delete"
+    dco_msgs[prompt_ru]="${textcolor}[?]${clear} Выберите outbound для удаления или 0 для отмены:"
+    dco_msgs[prompt_en]="${textcolor}[?]${clear} Select an outbound to delete or 0 to cancel:"
+    dco_msgs[warn_users_ru]="${yellow}Внимание: следующие пользователи используют outbound '%s':\n%s\nИх выходная нода будет переключена на 'direct'. Продолжить? [y/N]:${clear}"
+    dco_msgs[warn_users_en]="${yellow}Warning: the following users are using outbound '%s':\n%s\nTheir outbound node will be reverted to 'direct'. Continue? [y/N]:${clear}"
+    dco_msgs[success_ru]="Outbound ${textcolor}%s${clear} успешно удалён"
+    dco_msgs[success_en]="Outbound ${textcolor}%s${clear} successfully deleted"
+
+    local custom_tags=()
+    for t in $(jq -r '.outbounds[]?.tag' /etc/sing-box/config.json 2>/dev/null); do
+        if [[ "$t" != "direct" && "$t" != "warp" && "$t" != "proxy" && "$t" != "IPv4" && "$t" != "block" && -n "$t" ]]; then
+            custom_tags+=("$t")
+        fi
+    done
+
+    if [[ ${#custom_tags[@]} -eq 0 ]]; then
+        echo -e "${dco_msgs[no_custom_$language]}"
+        echo ""
+        return 0
+    fi
+
+    echo -e "${dco_msgs[prompt_$language]}"
+    echo "0 - Отмена"
+    for idx in "${!custom_tags[@]}"; do
+        local num=$((idx + 1))
+        local t="${custom_tags[$idx]}"
+        local otype osrv oport oiface desc=""
+        otype=$(jq -r --arg t "$t" '.outbounds[] | select(.tag == $t) | .type' /etc/sing-box/config.json 2>/dev/null)
+        osrv=$(jq -r --arg t "$t" '.outbounds[] | select(.tag == $t) | .server // empty' /etc/sing-box/config.json 2>/dev/null)
+        oport=$(jq -r --arg t "$t" '.outbounds[] | select(.tag == $t) | .server_port // empty' /etc/sing-box/config.json 2>/dev/null)
+        oiface=$(jq -r --arg t "$t" '.outbounds[] | select(.tag == $t) | .bind_interface // empty' /etc/sing-box/config.json 2>/dev/null)
+        if [[ -n "$osrv" ]]; then
+            desc="(${otype}, ${osrv}:${oport})"
+        elif [[ -n "$oiface" ]]; then
+            desc="(${otype}, iface: ${oiface})"
+        else
+            desc="(${otype})"
+        fi
+        echo "${num} - ${t} ${desc}"
+    done
+
+    read -r del_sel
+    [[ -n $del_sel ]] && echo ""
+    [[ "$del_sel" == "0" || ${del_sel,,} =~ ^(x|х|q)$ ]] && return 0
+
+    if [[ "$del_sel" =~ ^[0-9]+$ ]] && [[ "$del_sel" -ge 1 && "$del_sel" -le "${#custom_tags[@]}" ]]; then
+        local del_tag="${custom_tags[$((del_sel - 1))]}"
+
+        local affected_users=""
+        local valid_users
+        valid_users=$(jq -r '[(.inbounds[]?.users // [])[].name] | unique[]' /etc/sing-box/config.json 2>/dev/null)
+        for u in $valid_users; do
+            local un
+            un=$(get_user_node "$u")
+            if [[ "$un" == "$del_tag" ]]; then
+                affected_users+="  - ${u}\n"
+            fi
+        done
+
+        if [[ -n "$affected_users" ]]; then
+            printf "${dco_msgs[warn_users_$language]}\n" "$del_tag" "$affected_users"
+            read -r confirm_del
+            [[ -n $confirm_del ]] && echo ""
+            [[ ! ${confirm_del,,} =~ ^(y|yes|д|да)$ ]] && return 0
+
+            if [[ -f /etc/secret-sing-box/user-routes ]]; then
+                sed -i "s/:${del_tag}:/:direct:/g" /etc/secret-sing-box/user-routes
+            fi
+        fi
+
+        echo "$(jq --arg t "$del_tag" 'del(.outbounds[] | select(.tag == $t))' /etc/sing-box/config.json)" > /etc/sing-box/config.json
+        apply_user_routing
+
+        printf "${dco_msgs[success_$language]}\n" "$del_tag"
+        echo ""
+    fi
+}
+
+outbounds_menu() {
+    declare -A -g ob_title=()
+    ob_title[ru]="${textcolor}Управление выходными серверами (Outbound):${clear}"
+    ob_title[en]="${textcolor}Outbound nodes management:${clear}"
+
+    declare -A -g ob_actions=()
+    ob_actions[ru]="${textcolor}Выберите действие:${clear}
+0 - Назад в главное меню
+1 - Добавить outbound по ссылке (vless://, vmess://, trojan://, ss://, socks5://, http://)
+2 - Добавить outbound через интерфейс / туннель (WireGuard wg0, tun и др.)
+3 - Добавить outbound вручную (SOCKS5 / HTTP прокси)
+4 - Удалить добавленный outbound"
+
+    ob_actions[en]="${textcolor}Select an action:${clear}
+0 - Back to main menu
+1 - Add outbound via proxy link (vless://, vmess://, trojan://, ss://, socks5://, http://)
+2 - Add outbound via interface / tunnel (WireGuard wg0, tun, etc.)
+3 - Add outbound manually (SOCKS5 / HTTP proxy)
+4 - Delete custom outbound"
+
+    while true
+    do
+        echo ""
+        echo -e "${ob_title[$language]}"
+        echo "--------------------------------------------------------------------------------"
+        show_outbounds_table
+        echo "--------------------------------------------------------------------------------"
+        echo -e "${ob_actions[$language]}"
+        read -r ob_choice
+        [[ -n $ob_choice ]] && echo ""
+
+        case $ob_choice in
+            0|x|х)
+            main_menu
+            return
+            ;;
+            1)
+            add_outbound_by_link
+            ;;
+            2)
+            add_outbound_by_interface
+            ;;
+            3)
+            add_outbound_manually
+            ;;
+            4)
+            delete_custom_outbound
+            ;;
+            *)
+            continue
+            ;;
+        esac
     done
 }
 
@@ -1299,12 +2223,12 @@ show_warp_domains() {
 
     check_warp
     echo -e "${info_message[1_$language]}"
-    jq -r '.route.rules[] | select(.outbound == "warp") | .domain_suffix[]' /etc/sing-box/config.json
+    jq -r '.route.rules[] | select(.outbound == "warp" and (has("auth_user") | not)) | .domain_suffix[]' /etc/sing-box/config.json
     echo ""
     main_menu
 }
 
-### OPTION 8 - ADD WARP DOMAINS ###
+### OPTION 7 - ADD WARP DOMAINS ###
 
 exit_warp_add() {
     if [[ ${new_warp,,} =~ ^(x|х)$ ]]
@@ -1326,7 +2250,7 @@ check_domain_warp_add() {
     check_message[1_en]="${red}Error: this domain/suffix is already added to WARP${clear}"
     check_message[2_en]="${textcolor}[?]${clear} Enter a new domain/suffix for WARP routing or enter ${textcolor}x${clear} to exit:"
 
-    while [[ -z $new_warp ]] || [[ $(jq "any(.route.rules[] | select(.outbound == \"warp\") | .domain_suffix[]; . == \"${new_warp}\")" /etc/sing-box/config.json) != "false" ]]
+    while [[ -z $new_warp ]] || [[ $(jq "any(.route.rules[] | select(.outbound == \"warp\" and (has(\"auth_user\") | not)) | .domain_suffix[]; . == \"${new_warp}\")" /etc/sing-box/config.json) != "false" ]]
     do
         if [[ -n $new_warp ]]
         then
@@ -1359,7 +2283,7 @@ edit_conf_warp_add() {
     info_message[1_ru]="Домен/суффикс ${textcolor}${new_warp}${clear} добавлен в WARP"
     info_message[1_en]="Domain/suffix ${textcolor}${new_warp}${clear} is added to WARP routing"
 
-    warp_rule_num=$(jq '[.route.rules[].outbound] | index("warp")' /etc/sing-box/config.json)
+    warp_rule_num=$(jq '[.route.rules[] | (.outbound == "warp" and (has("auth_user") | not))] | index(true)' /etc/sing-box/config.json)
     echo "$(jq ".route.rules[${warp_rule_num}].domain_suffix += [\"${new_warp}\"]" /etc/sing-box/config.json)" > /etc/sing-box/config.json
     systemctl reload sing-box.service
     echo -e "${info_message[1_$language]}"
@@ -1376,7 +2300,7 @@ add_warp_domains() {
     done
 }
 
-### OPTION 9 - DELETE WARP DOMAINS ###
+### OPTION 8 - DELETE WARP DOMAINS ###
 
 exit_warp_del() {
     if [[ ${del_warp,,} =~ ^(x|х)$ ]]
@@ -1398,7 +2322,7 @@ check_domain_warp_del() {
     check_message[1_en]="${red}Error: this domain/suffix is not added to WARP routing${clear}"
     check_message[2_en]="${textcolor}[?]${clear} Enter a domain/suffix to delete from WARP routing or enter ${textcolor}x${clear} to exit:"
 
-    while [[ -z $del_warp ]] || [[ $(jq "any(.route.rules[] | select(.outbound == \"warp\") | .domain_suffix[]; . == \"${del_warp}\")" /etc/sing-box/config.json) != "true" ]]
+    while [[ -z $del_warp ]] || [[ $(jq "any(.route.rules[] | select(.outbound == \"warp\" and (has(\"auth_user\") | not)) | .domain_suffix[]; . == \"${del_warp}\")" /etc/sing-box/config.json) != "true" ]]
     do
         if [[ -n $del_warp ]]
         then
@@ -1431,7 +2355,7 @@ edit_conf_warp_del() {
     info_message[1_ru]="Домен/суффикс ${textcolor}${del_warp}${clear} удалён из WARP"
     info_message[1_en]="Domain/suffix ${textcolor}${del_warp}${clear} is deleted from WARP routing"
 
-    warp_rule_num=$(jq '[.route.rules[].outbound] | index("warp")' /etc/sing-box/config.json)
+    warp_rule_num=$(jq '[.route.rules[] | (.outbound == "warp" and (has("auth_user") | not))] | index(true)' /etc/sing-box/config.json)
     echo "$(jq "del(.route.rules[${warp_rule_num}].domain_suffix[] | select(. == \"${del_warp}\"))" /etc/sing-box/config.json)" > /etc/sing-box/config.json
     systemctl reload sing-box.service
     echo -e "${info_message[1_$language]}"
@@ -2873,28 +3797,29 @@ main_menu_text_ru() {
     echo "0 - Выйти"
     echo "1 - Список пользователей"
     echo "2 - Добавить нового пользователя"
+    echo "3 - Управление выходными серверами (Outbound)"
     echo "---------------------------------"
-    echo "3 - Синхронизировать настройки во всех клиентских конфигах"
-    echo "4 - Настроить на клиенте подключение к выбранному IP Cloudflare"
+    echo "4 - Синхронизировать настройки во всех клиентских конфигах"
+    echo "5 - Настроить на клиенте подключение к выбранному IP Cloudflare"
     echo "---------------------------------"
-    echo "5 - Вывести список доменов/суффиксов WARP"
-    echo "6 - Добавить домен/суффикс в WARP"
-    echo "7 - Удалить домен/суффикс из WARP"
+    echo "6 - Вывести список доменов/суффиксов WARP"
+    echo "7 - Добавить домен/суффикс в WARP"
+    echo "8 - Удалить домен/суффикс из WARP"
     echo "---------------------------------"
-    echo "8 - Настроить/убрать цепочку из двух и более серверов"
+    echo "9 - Настроить/убрать цепочку из двух и более серверов"
     echo "---------------------------------"
-    echo "9 - Обновить сертификат вручную"
-    echo "10 - Сменить домен"
-    echo "11 - Поменять пути для ${paths_to_change}подписки и наборов правил"
+    echo "10 - Обновить сертификат вручную"
+    echo "11 - Сменить домен"
+    echo "12 - Поменять пути для ${paths_to_change}подписки и наборов правил"
     echo "---------------------------------"
-    echo "12 - Отключить IPv6 на сервере"
-    echo "13 - Включить IPv6 на сервере"
+    echo "13 - Отключить IPv6 на сервере"
+    echo "14 - Включить IPv6 на сервере"
     echo "---------------------------------"
-    echo "14 - Показать пути до конфигов и других значимых файлов"
-    echo "15 - Обновить"
+    echo "15 - Показать пути до конфигов и других значимых файлов"
+    echo "16 - Обновить"
     echo "---------------------------------"
-    echo "16 - Управление blacklist (сети обнаружения)"
-    echo "17 - Удалить Secret Sing-Box"
+    echo "17 - Управление blacklist (сети обнаружения)"
+    echo "18 - Удалить Secret Sing-Box"
     read -r option
     [[ -n $option ]] && echo ""
 }
@@ -2905,28 +3830,29 @@ main_menu_text_en() {
     echo "0 - Exit"
     echo "1 - User list"
     echo "2 - Add a new user"
+    echo "3 - Outbound nodes management"
     echo "---------------------------------"
-    echo "3 - Sync settings in all client configs"
-    echo "4 - Setup connection to custom Cloudflare IP on the client"
+    echo "4 - Sync settings in all client configs"
+    echo "5 - Setup connection to custom Cloudflare IP on the client"
     echo "---------------------------------"
-    echo "5 - Show the list of domains/suffixes routed through WARP"
-    echo "6 - Add a new domain/suffix to WARP routing"
-    echo "7 - Delete a domain/suffix from WARP routing"
+    echo "6 - Show the list of domains/suffixes routed through WARP"
+    echo "7 - Add a new domain/suffix to WARP routing"
+    echo "8 - Delete a domain/suffix from WARP routing"
     echo "---------------------------------"
-    echo "8 - Setup/remove a chain of two or more servers"
+    echo "9 - Setup/remove a chain of two or more servers"
     echo "---------------------------------"
-    echo "9 - Renew certificate manually"
-    echo "10 - Change domain"
-    echo "11 - Change paths for ${paths_to_change}subscription and rule sets"
+    echo "10 - Renew certificate manually"
+    echo "11 - Change domain"
+    echo "12 - Change paths for ${paths_to_change}subscription and rule sets"
     echo "---------------------------------"
-    echo "12 - Disable IPv6 on the server"
-    echo "13 - Enable IPv6 on the server"
+    echo "13 - Disable IPv6 on the server"
+    echo "14 - Enable IPv6 on the server"
     echo "---------------------------------"
-    echo "14 - Show paths to configs and other important files"
-    echo "15 - Update"
+    echo "15 - Show paths to configs and other important files"
+    echo "16 - Update"
     echo "---------------------------------"
-    echo "16 - Blacklist management (detection networks)"
-    echo "17 - Uninstall Secret Sing-Box"
+    echo "17 - Blacklist management (detection networks)"
+    echo "18 - Uninstall Secret Sing-Box"
     read -r option
     [[ -n $option ]] && echo ""
 }
@@ -2990,54 +3916,63 @@ main_menu() {
         add_users
         ;;
         3)
-        sync_client_configs
+        outbounds_menu
         ;;
         4)
-        cf_ip_settings
+        sync_client_configs
         ;;
         5)
-        show_warp_domains
+        cf_ip_settings
         ;;
         6)
-        add_warp_domains
+        show_warp_domains
         ;;
         7)
-        delete_warp_domains
+        add_warp_domains
         ;;
         8)
-        chain_setup
+        delete_warp_domains
         ;;
         9)
-        renew_cert
+        chain_setup
         ;;
         10)
-        change_domain
+        renew_cert
         ;;
         11)
-        change_paths
+        change_domain
         ;;
         12)
-        disable_ipv6
+        change_paths
         ;;
         13)
-        enable_ipv6
+        disable_ipv6
         ;;
         14)
-        show_paths_${language}
+        enable_ipv6
         ;;
         15)
-        update_ssb
+        show_paths_${language}
         ;;
         16)
-        manage_blacklist
+        update_ssb
         ;;
         17)
+        manage_blacklist
+        ;;
+        18)
         uninstall_menu
         ;;
         *)
         exit 0
     esac
 }
+
+if [[ "$1" == "--apply-routes" ]]; then
+    check_config_json
+    apply_user_routing
+    exit 0
+fi
 
 check_root
 check_config_json
