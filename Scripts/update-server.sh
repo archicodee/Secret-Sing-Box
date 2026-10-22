@@ -193,6 +193,8 @@ update_services() {
     apt update -y && apt -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" full-upgrade -y
     apt-mark hold sing-box
     apt autoremove -y; apt autoclean -y
+    mkdir -p /etc/systemd/system/sing-box.service.d
+    echo -e "[Service]\nExecReload=/bin/kill -HUP \$MAINPID" > /etc/systemd/system/sing-box.service.d/override.conf
     systemctl daemon-reload
 
     systemctl start sing-box.service

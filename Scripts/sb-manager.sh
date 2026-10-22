@@ -664,6 +664,36 @@ except Exception as e:
 PYEOF
 }
 
+reload_sing_box() {
+    # Ensure systemd service has ExecReload defined via drop-in override
+    if [[ ! -f /etc/systemd/system/sing-box.service.d/override.conf ]]
+    then
+        mkdir -p /etc/systemd/system/sing-box.service.d 2>/dev/null || true
+        cat << 'EOF' > /etc/systemd/system/sing-box.service.d/override.conf 2>/dev/null || true
+[Service]
+ExecReload=/bin/kill -HUP $MAINPID
+EOF
+        systemctl daemon-reload 2>/dev/null || true
+    fi
+
+    # 1. Try systemctl reload (standard graceful SIGHUP via systemd)
+    if systemctl reload sing-box.service 2>/dev/null
+    then
+        return 0
+    fi
+
+    # 2. Try direct SIGHUP to running sing-box process for zero-downtime hot-reload
+    local pid
+    pid=$(pgrep -x sing-box 2>/dev/null || true)
+    if [[ -n "$pid" ]] && kill -HUP "$pid" 2>/dev/null
+    then
+        return 0
+    fi
+
+    # 3. Fallback: restart service so changes are guaranteed to take effect immediately on the fly
+    systemctl restart sing-box.service 2>/dev/null || true
+}
+
 get_user_node() {
     local u="$1"
     local match
@@ -904,7 +934,7 @@ apply_user_routing() {
 
     if [[ "$check_ok" == "true" ]]; then
         rm -f /etc/sing-box/config.json.bak-routing
-        systemctl reload sing-box.service 2>/dev/null || true
+        reload_sing_box
         return 0
     else
         cp -f /etc/sing-box/config.json.bak-routing /etc/sing-box/config.json
@@ -1531,7 +1561,7 @@ add_outbound_by_link() {
 
     if [[ "$check_ok" == "true" ]]; then
         rm -f /etc/sing-box/config.json.bak-outbound
-        systemctl reload sing-box.service 2>/dev/null || true
+        reload_sing_box
         printf "${aol_msgs[success_$language]}\n" "$new_tag"
         echo ""
     else
@@ -1598,7 +1628,7 @@ add_outbound_by_interface() {
 
     if [[ "$check_ok" == "true" ]]; then
         rm -f /etc/sing-box/config.json.bak-outbound
-        systemctl reload sing-box.service 2>/dev/null || true
+        reload_sing_box
         printf "${aoi_msgs[success_$language]}\n" "$iface_tag"
         echo ""
     else
@@ -1690,7 +1720,7 @@ add_outbound_manually() {
 
     if [[ "$check_ok" == "true" ]]; then
         rm -f /etc/sing-box/config.json.bak-outbound
-        systemctl reload sing-box.service 2>/dev/null || true
+        reload_sing_box
         printf "${aom_msgs[success_$language]}\n" "$m_tag"
         echo ""
     else
@@ -2285,7 +2315,7 @@ edit_conf_warp_add() {
 
     warp_rule_num=$(jq '[.route.rules[] | (.outbound == "warp" and (has("auth_user") | not))] | index(true)' /etc/sing-box/config.json)
     echo "$(jq ".route.rules[${warp_rule_num}].domain_suffix += [\"${new_warp}\"]" /etc/sing-box/config.json)" > /etc/sing-box/config.json
-    systemctl reload sing-box.service
+    reload_sing_box
     echo -e "${info_message[1_$language]}"
     echo ""
 }
@@ -2357,7 +2387,7 @@ edit_conf_warp_del() {
 
     warp_rule_num=$(jq '[.route.rules[] | (.outbound == "warp" and (has("auth_user") | not))] | index(true)' /etc/sing-box/config.json)
     echo "$(jq "del(.route.rules[${warp_rule_num}].domain_suffix[] | select(. == \"${del_warp}\"))" /etc/sing-box/config.json)" > /etc/sing-box/config.json
-    systemctl reload sing-box.service
+    reload_sing_box
     echo -e "${info_message[1_$language]}"
     echo ""
 }
@@ -2498,7 +2528,7 @@ chain_end() {
     rule_sets_add=()
     rule_sets_del=(google telegram)
     manage_rule_sets
-    systemctl reload sing-box.service
+    reload_sing_box
     echo "${info_message[1_$language]}"
     echo ""
     main_menu
@@ -2549,7 +2579,7 @@ chain_middle() {
     rule_sets_add=()
     rule_sets_del=(google telegram)
     manage_rule_sets
-    systemctl reload sing-box.service
+    reload_sing_box
     echo "${info_message[1_$language]}"
     echo ""
     main_menu
@@ -3218,7 +3248,8 @@ edit_configs_with_paths() {
     sed -i "s/${subspath_old}/${subspath}/g" /var/www/${subspath_old}/sub.html
     mv -f /var/www/${subspath_old} /var/www/${subspath}
     mv -f /var/www/${rulesetpath_old} /var/www/${rulesetpath}
-    systemctl reload sing-box.service nginx.service
+    reload_sing_box
+    systemctl reload nginx.service 2>/dev/null || systemctl restart nginx.service 2>/dev/null || true
     [[ -f /etc/haproxy/auth.lua ]] && systemctl reload haproxy.service
 
     echo "${info_message[1_$language]}"
