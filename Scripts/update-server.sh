@@ -29,7 +29,7 @@ check_update() {
     info_message[5_en]="${red}Update cancelled${clear}"
 
     [[ ! $language =~ ^[a-z]+$ ]] && language="ru"   # Legacy
-    new_version="1.5.3"
+    new_version="1.5.5"
 
     if [[ "$version" == "$new_version" ]]
     then
@@ -56,16 +56,19 @@ extract_values() {
         transport=$(jq -r '.inbounds[] | select(.tag == "trojan-in") | .transport.type' /etc/sing-box/config.json)
     fi
 
-    if [[ $(jq 'any(.route.rules[]; .outbound == "warp")' /etc/sing-box/config.json) == "true" ]]
+    if [[ $(jq 'any(.route.rules[]; .outbound == "warp" and (has("auth_user") | not))' /etc/sing-box/config.json) == "true" ]]
     then
-        warp_domain_suffix=$(jq '.route.rules[] | select(.outbound == "warp") | .domain_suffix' /etc/sing-box/config.json)
-        warp_rule_set=$(jq '.route.rules[] | select(.outbound == "warp") | .rule_set' /etc/sing-box/config.json)
+        warp_domain_suffix=$(jq '.route.rules[] | select(.outbound == "warp" and (has("auth_user") | not)) | .domain_suffix' /etc/sing-box/config.json)
+        warp_rule_set=$(jq '.route.rules[] | select(.outbound == "warp" and (has("auth_user") | not)) | .rule_set' /etc/sing-box/config.json)
     fi
 
     if [[ $(jq 'any(.outbounds[]; .tag == "proxy")' /etc/sing-box/config.json) == "true" ]]
     then
         chain_outbound=$(jq '.outbounds[] | select(.tag == "proxy")' /etc/sing-box/config.json)
     fi
+
+    # Capture custom outbounds added by user
+    custom_outbounds=$(jq -c '[.outbounds[] | select(.tag != "direct" and .tag != "warp" and .tag != "proxy" and .tag != "IPv4" and .tag != "block")]' /etc/sing-box/config.json 2>/dev/null)
 
     # Capture old rule_set tags for preservation during update
     old_rule_sets=()
@@ -90,9 +93,15 @@ insert_values() {
 
     if [[ -n $warp_domain_suffix ]]
     then
-        warp_rule_num=$(jq '[.route.rules[].outbound] | index("warp")' /etc/sing-box/config.json)
+        warp_rule_num=$(jq '[.route.rules[] | (.outbound == "warp" and (has("auth_user") | not))] | index(true)' /etc/sing-box/config.json)
         echo "$(jq ".route.rules[${warp_rule_num}].domain_suffix |= ${warp_domain_suffix}" /etc/sing-box/config.json)" > /etc/sing-box/config.json
         [[ -n $warp_rule_set ]] && echo "$(jq ".route.rules[${warp_rule_num}].rule_set |= ${warp_rule_set}" /etc/sing-box/config.json)" > /etc/sing-box/config.json
+    fi
+
+    # Restore custom outbounds
+    if [[ -n "$custom_outbounds" && "$custom_outbounds" != "[]" && "$custom_outbounds" != "null" ]]
+    then
+        echo "$(jq --argjson co "$custom_outbounds" '.outbounds += $co' /etc/sing-box/config.json)" > /etc/sing-box/config.json
     fi
 
     if [[ -n $chain_outbound ]]
@@ -100,7 +109,7 @@ insert_values() {
         insert_chain
     fi
 
-    sed -i "s/${temprulesetpath}/${rulesetpath}/g" /etc/sing-box/config.json
+    sed -i -e "s/RULESETPATH/${rulesetpath}/g" -e "s/${temprulesetpath}/${rulesetpath}/g" /etc/sing-box/config.json
     chmod -R 755 /var/www/${rulesetpath}
 }
 
@@ -168,11 +177,13 @@ update_services() {
     [[ -f /etc/secret-sing-box/config ]] && cp -f /etc/secret-sing-box/config /etc/secret-sing-box/config.bak
     wget -O /etc/sing-box/config.json.1 https://raw.githubusercontent.com/archicodee/Secret-Sing-Box/master/Config-Templates/config.json
 
-    if [[ $? -eq 0 ]]
+    if [[ $? -eq 0 && -s /etc/sing-box/config.json.1 ]] && jq empty /etc/sing-box/config.json.1 >/dev/null 2>&1
     then
         mv -f /etc/sing-box/config.json.1 /etc/sing-box/config.json
         insert_values
         manage_rule_sets
+    else
+        rm -f /etc/sing-box/config.json.1
     fi
 
     curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
@@ -184,7 +195,16 @@ update_services() {
     apt update -y && apt -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" full-upgrade -y
     apt-mark hold sing-box
     apt autoremove -y; apt autoclean -y
+    mkdir -p /etc/systemd/system/sing-box.service.d
+    echo -e "[Service]\nExecReload=/bin/kill -HUP \$MAINPID" > /etc/systemd/system/sing-box.service.d/override.conf
     systemctl daemon-reload
+
+    # Verify sing-box config before starting service; rollback to config.json.0 if invalid
+    if command -v sing-box >/dev/null 2>&1; then
+        if ! sing-box check -c /etc/sing-box/config.json >/dev/null 2>&1; then
+            cp -f /etc/sing-box/config.json.0 /etc/sing-box/config.json
+        fi
+    fi
 
     systemctl start sing-box.service
     systemctl start warp-svc.service
@@ -235,6 +255,14 @@ update_scripts() {
     grep -q "alias ssb=" /etc/bash.bashrc || echo "alias ssb='/usr/local/bin/sbmanager'" >> /etc/bash.bashrc   # Legacy
     grep -q "alias sudo=" /etc/bash.bashrc || echo "alias sudo='sudo '" >> /etc/bash.bashrc   # Legacy
     [[ ! $(crontab -l) =~ "PATH=" ]] && crontab -l | sed '1i PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin' | crontab -   # Legacy
+    mkdir -p /etc/secret-sing-box
+    if [[ ! -f /etc/secret-sing-box/user-routes ]]; then
+        touch /etc/secret-sing-box/user-routes
+        for u in $(jq -r '[(.inbounds[]?.users // [])[].name] | unique[]' /etc/sing-box/config.json 2>/dev/null); do
+            echo "${u}:direct:default" >> /etc/secret-sing-box/user-routes
+        done
+    fi
+    /usr/local/bin/sbmanager --apply-routes >/dev/null 2>&1 || true
     echo ""
 }
 

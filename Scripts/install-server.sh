@@ -2011,6 +2011,9 @@ setup_sing_box() {
     fi
 
     download_rule_sets
+    mkdir -p /etc/systemd/system/sing-box.service.d
+    echo -e "[Service]\nExecReload=/bin/kill -HUP \$MAINPID" > /etc/systemd/system/sing-box.service.d/override.conf
+    systemctl daemon-reload
     systemctl restart sing-box.service
     systemctl enable sing-box.service
     echo ""
