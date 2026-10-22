@@ -1,6 +1,6 @@
 #!/bin/bash
 
-version="1.5.3"
+version="1.5.5"
 
 textcolor='\033[1;36m'
 red='\033[1;31m'
